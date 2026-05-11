@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Polymarket Bot Dashboard</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        body { font-family: monospace; background: #0a0a0a; color: #00ff00; padding: 20px; }
+        .header { color: #ffff00; font-size: 24px; border-bottom: 2px solid #ffff00; padding-bottom: 10px; }
+        .section { margin: 20px 0; padding: 15px; background: #1a1a1a; border-left: 4px solid #00ff00; }
+        .metric { display: inline-block; margin: 10px 20px; }
+        .label { color: #888; }
+        .value { color: #00ff00; font-size: 20px; font-weight: bold; }
+        .warning { color: #ff6600; }
+        .error { color: #ff0000; }
+        .success { color: #00ff00; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #333; }
+        th { color: #ffff00; }
+    </style>
+</head>
+<body>
+    <div class="header">🦞 POLYMARKET BOT v2.0 - LIVE DASHBOARD</div>
+    
+    <div class="section">
+        <h3>📊 Bot Status</h3>
+        <div class="metric">
+            <div class="label">Mode</div>
+            <div class="value" style="color: #ff0000;">LIVE (REAL MONEY)</div>
+        </div>
+        <div class="metric">
+            <div class="label">Status</div>
+            <div class="value success" style="color: #ff0000;">LIVE TRADING</div>
+        </div>
+        <div class="metric">
+            <div class="label">Balance</div>
+            <div class="value">$2.30</div>
+        </div>
+        <div class="metric">
+            <div class="label">Coins</div>
+            <div class="value">BTC, ETH</div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h3>📈 Performance (Last 8 Trades)</h3>
+        <div class="metric">
+            <div class="label">Total Trades</div>
+            <div class="value">8</div>
+        </div>
+        <div class="metric">
+            <div class="label">Win Rate</div>
+            <div class="value warning">0.0%</div>
+        </div>
+        <div class="metric">
+            <div class="label">P&L</div>
+            <div class="value">$0.00</div>
+        </div>
+    </div>
+    
+    <div class="section">
+        <h3>💡 Watcher Suggestions</h3>
+        <ul>
+            <li class="warning">🟠 [HIGH] Win rate below 50% → Increase MIN_CONFIDENCE in .env</li>
+        </ul>
+    </div>
+    
+    <div class="section">
+        <h3>🎯 Strategy Breakdown</h3>
+        <table>
+            <tr><th>Strategy</th><th>Win Rate</th><th>P&L</th><th>Trades</th></tr>
+            <tr><td>time_decay</td><td>0.0%</td><td>$0.00</td><td>4</td></tr>
+            <tr><td>cross_tf_arb</td><td>0.0%</td><td>$0.00</td><td>4</td></tr>
+        </table>
+    </div>
+    
+    <div class="section">
+        <h3>🔧 Actions</h3>
+        <p>Telegram Commands:</p>
+        <ul>
+            <li><b>/start</b> - Welcome & menu</li>
+            <li><b>/trade</b> - Start trading</li>
+            <li><b>/stop</b> - Stop trading</li>
+            <li><b>/status</b> - Check status</li>
+            <li><b>/download</b> - Export trades CSV</li>
+        </ul>
+    </div>
+    
+    <div style="margin-top: 30px; color: #666; text-align: center;">
+        Auto-refreshes every 5 seconds | Last update: <span id="time"></span>
+    </div>
+    
+    <script>
+        document.getElementById('time').textContent = new Date().toLocaleTimeString();
+    </script>
+</body>
+</html>

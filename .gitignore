@@ -1,0 +1,30 @@
+# Secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Bot runtime data
+bot_status.json
+data/Polymarket_data/
+*.log
+_check_*.py
+_test_*.py
+check_*.py

@@ -1,0 +1,1238 @@
+"""
+Auto-Redeem: On-chain redemption of resolved Polymarket positions.
+
+When a prediction market resolves, your conditional tokens (position shares)
+need to be redeemed back to USDC. Polymarket auto-settles eventually, but
+it can take 10+ minutes — leaving your balance at $0 while profits are locked.
+
+This module supports TWO redemption methods:
+
+1. **Direct on-chain** (default): Signs a Gnosis Safe `execTransaction` and
+   submits it directly to Polygon.  Works with proxy wallets (sig_type=2).
+   Costs ~0.004 POL gas per redemption.  Requires POLY_PRIVATE_KEY only.
+
+2. **Gasless builder relayer** (optional): Uses Polymarket's builder relayer
+   for zero-gas redemption.  Requires POLY_BUILDER_* credentials.
+
+The bot auto-detects which method is available and uses the best one.
+
+Required:  POLY_PRIVATE_KEY (already set for trading)
+Optional:  POLY_BUILDER_API_KEY, POLY_BUILDER_SECRET, POLY_BUILDER_PASSPHRASE
+
+Dependencies: web3, eth-abi, eth-account, requests
+"""
+
+import asyncio
+import logging
+import os
+import time
+import traceback
+from typing import Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
+
+# ─── Contract addresses on Polygon Mainnet ───
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # Polymarket USD (pUSD) - NEW
+USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Legacy USDC.e
+NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
+
+# Polygon RPC endpoints (fallback list)
+DEFAULT_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://rpc.ankr.com/polygon",
+    "https://1rpc.io/matic",
+    "https://polygon.llamarpc.com",
+]
+
+# Gnosis Safe nonce() selector
+SAFE_NONCE_SELECTOR = "0xaffed0e0"
+
+# EIP-712 typehashes for Gnosis Safe v1.3.0
+SAFE_TX_TYPEHASH = bytes.fromhex(
+    "bb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
+)
+DOMAIN_SEPARATOR_TYPEHASH = bytes.fromhex(
+    "47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218"
+)
+
+
+class AutoRedeemer:
+    """Auto-redemption of resolved Polymarket positions via Gnosis Safe."""
+
+    def __init__(self, clob_client, sig_type: int = 0):
+        self.clob_client = clob_client
+        self.sig_type = sig_type
+        self._last_check = 0.0
+        self._check_interval = 120.0   # Check every 2 minutes
+        self._redeemed_conditions: Set[str] = set()
+        self._init_errors: List[str] = []
+        self._enabled = False
+        self._method = "none"   # "direct" | "relayer" | "direct_eoa" | "none"
+        self._total_redeemed = 0
+        self._total_usd_recovered = 0.0
+        self._private_key = ""
+        self._proxy_wallet = ""
+        self._signer_address = ""
+        self._w3 = None
+        self._relayer = None
+
+    # ─── Initialization ───────────────────────────────────────────────
+
+    def init(self) -> bool:
+        """Initialize auto-redeemer.  Returns True if any method is available."""
+        from config import Config
+
+        pk = (Config.POLY_PRIVATE_KEY or "").strip()
+        if not pk:
+            self._init_errors.append("No POLY_PRIVATE_KEY")
+            return False
+        if not pk.startswith("0x"):
+            pk = "0x" + pk
+        self._private_key = pk
+
+        self._proxy_wallet = (Config.POLY_PROXY_WALLET or "").strip()
+
+        try:
+            from eth_account import Account
+            acct = Account.from_key(pk)
+            self._signer_address = acct.address
+            if not self._proxy_wallet:
+                self._proxy_wallet = acct.address
+        except Exception as e:
+            self._init_errors.append(f"Key error: {e}")
+            return False
+
+        # ── Method 1: Gasless builder relayer (if credentials provided) ──
+        bk = os.getenv("POLY_BUILDER_API_KEY", "").strip()
+        bs = os.getenv("POLY_BUILDER_SECRET", "").strip()
+        bp = os.getenv("POLY_BUILDER_PASSPHRASE", "").strip()
+        if bk and bs and bp:
+            try:
+                from py_builder_relayer_client.client import RelayClient
+                from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+                builder_config = BuilderConfig(
+                    local_builder_creds=BuilderApiKeyCreds(key=bk, secret=bs, passphrase=bp)
+                )
+                self._relayer = RelayClient(
+                    relayer_url="https://relayer-v2.polymarket.com",
+                    chain_id=137, private_key=pk, builder_config=builder_config,
+                )
+                self._method = "relayer"
+                self._enabled = True
+                print("✅ Auto-redeem: gasless builder relayer (primary)", flush=True)
+            except Exception as e:
+                self._init_errors.append(f"Relayer init: {e}")
+
+        # ── Always init web3 as fallback (even if relayer works) ──
+        self._init_web3()
+
+        # ── If relayer failed, use direct on-chain as primary ──
+        if not self._enabled:
+            if self._w3:
+                if self.sig_type == 2 and self._proxy_wallet:
+                    self._method = "direct"
+                else:
+                    self._method = "direct_eoa"
+                self._enabled = True
+                print(f"✅ Auto-redeem: direct on-chain "
+                      f"({'Safe' if self.sig_type == 2 else 'EOA'})", flush=True)
+            else:
+                self._method = "none"
+        elif self._w3:
+            print("✅ Auto-redeem: direct on-chain ready as fallback", flush=True)
+
+        if not self._enabled:
+            print(f"⚠️ Auto-redeem disabled: "
+                  f"{'; '.join(self._init_errors) or 'no method available'}", flush=True)
+        return self._enabled
+
+    def _init_web3(self) -> bool:
+        """Connect to a working Polygon RPC endpoint."""
+        try:
+            from web3 import Web3
+            from config import Config
+
+            rpc_env = os.getenv("POLYGON_RPC_URL", "").strip()
+            rpcs = [rpc_env] + DEFAULT_RPCS if rpc_env else list(DEFAULT_RPCS)
+
+            for rpc_url in rpcs:
+                try:
+                    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 10}))
+                    if w3.is_connected():
+                        self._w3 = w3
+                        # Mask API keys in log output
+                        display_url = rpc_url.split('/v2/')[0] + '/v2/***' if '/v2/' in rpc_url else rpc_url[:40]
+                        role = "fallback" if self._relayer else "primary"
+                        print(f"✅ Auto-redeem: web3 connected ({role}) "
+                              f"via {display_url}", flush=True)
+                        return True
+                except Exception:
+                    continue
+
+            self._init_errors.append("No working Polygon RPC")
+            return False
+
+        except ImportError as e:
+            self._init_errors.append(f"web3 not installed: {e}")
+            return False
+
+    # Backward-compatible alias
+    def init_relayer(self) -> bool:
+        return self.init()
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    # ─── Main check loop ──────────────────────────────────────────────
+
+    async def check_and_redeem(self) -> Dict:
+        """Check for unredeemed resolved positions and redeem them."""
+        if not self._enabled:
+            return {"redeemed": 0, "total_redeemed_usd": 0}
+
+        now = time.time()
+        if now - self._last_check < self._check_interval:
+            return {"redeemed": 0, "total_redeemed_usd": 0}
+        self._last_check = now
+
+        try:
+            # ── Clear any stuck pending txs before doing real work ──
+            if self._w3:
+                await self._clear_pending_txs()
+
+            # ── Pre-flight: check EOA has enough MATIC for gas ──
+            # Each redeem tx costs ~0.05-0.13 MATIC. If balance is too low,
+            # skip ALL redeems to avoid spamming "insufficient funds" errors.
+            # Skip this check if relayer is available (gasless).
+            try:
+                if self._w3 and not self._relayer:
+                    from eth_account import Account
+                    acct = Account.from_key(self._private_key)
+                    matic_balance = self._w3.eth.get_balance(acct.address)
+                    matic_eth = matic_balance / 1e18
+                    if matic_eth < 0.05:
+                        # Only log once per hour to avoid spam
+                        if not hasattr(self, '_last_gas_warning') or (now - self._last_gas_warning > 3600):
+                            print(f"⛽ EOA MATIC balance too low for redeems: {matic_eth:.4f} MATIC "
+                                  f"(need ~0.05+). Send MATIC to {acct.address}", flush=True)
+                            self._last_gas_warning = now
+                        return {"redeemed": 0, "total_redeemed_usd": 0, "skip_reason": "low_gas"}
+            except Exception as gas_err:
+                print(f"⚠️ Gas balance check failed (non-fatal): {gas_err}", flush=True)
+
+            positions = await self._get_conditional_positions()
+            if not positions:
+                return {"redeemed": 0, "total_redeemed_usd": 0}
+
+            redeemed = 0
+            failed = 0
+            total_usd = 0.0
+
+            for token_id, pos_info in positions.items():
+                # New format: pos_info is a dict with size, condition_id, neg_risk, etc.
+                if isinstance(pos_info, dict):
+                    balance = pos_info.get("size", 0)
+                    cached_condition_id = pos_info.get("condition_id", "")
+                    cached_neg_risk = pos_info.get("neg_risk", False)
+                    cached_redeemable = pos_info.get("redeemable", False)
+                    cached_title = pos_info.get("title", "")
+                else:
+                    # Legacy format (plain float) — backward compat
+                    balance = float(pos_info)
+                    cached_condition_id = ""
+                    cached_neg_risk = False
+                    cached_redeemable = False
+                    cached_title = ""
+
+                if balance <= 0:
+                    continue
+
+                # If data-api says it's redeemable AND has conditionId, skip Gamma lookup
+                if cached_redeemable and cached_condition_id:
+                    condition_id = cached_condition_id
+                    neg_risk = cached_neg_risk
+                    title = cached_title or condition_id[:16]
+                    closed = True  # data-api redeemable=True means already resolved
+                else:
+                    # Fallback: look up market via Gamma API
+                    market_info = await self._get_market_for_token(token_id)
+                    if not market_info:
+                        continue
+
+                    condition_id = market_info.get("condition_id",
+                                    market_info.get("conditionId", ""))
+                    if not condition_id:
+                        continue
+
+                    closed = market_info.get("closed", False)
+                    resolved = market_info.get("resolved", False)
+                    if not (closed or resolved):
+                        continue
+
+                    neg_risk = market_info.get("neg_risk",
+                                market_info.get("negRisk", False))
+                    title = market_info.get("question",
+                             market_info.get("title", condition_id[:16]))
+
+                if condition_id in self._redeemed_conditions:
+                    continue
+
+                print(f"💰 Auto-redeem: {title[:50]}... "
+                      f"({balance:.2f} tokens, neg_risk={neg_risk})", flush=True)
+
+                # Check USDC before redeem to measure actual payout
+                usdc_before = self._get_usdc_balance() if self._w3 else 0
+
+                ok = await self._redeem(condition_id, neg_risk)
+                if ok:
+                    self._redeemed_conditions.add(condition_id)
+                    redeemed += 1
+                    self._total_redeemed += 1
+
+                    # Measure actual USDC gained (not token count)
+                    usdc_after = self._get_usdc_balance() if self._w3 else 0
+                    actual_payout = max(0, usdc_after - usdc_before)
+                    total_usd += actual_payout
+                    self._total_usd_recovered += actual_payout
+
+                    if actual_payout > 0.01:
+                        print(f"✅ Redeemed +${actual_payout:.2f} USDC! "
+                              f"Session total: {self._total_redeemed} "
+                              f"(${self._total_usd_recovered:.2f})", flush=True)
+                    else:
+                        print(f"✅ Redeemed (losing side — $0 payout). "
+                              f"Session total: {self._total_redeemed}", flush=True)
+                else:
+                    failed += 1
+                    print(f"⚠️ Redeem failed: {condition_id[:16]}...", flush=True)
+                    # Allow up to 3 failures before stopping batch
+                    # (one failure might be a specific market issue, not gas/nonce)
+                    if failed >= 3:
+                        print(f"  ⛔ Stopping redeem batch after {failed} failures "
+                              f"(prevents tx queue buildup)", flush=True)
+                        break
+
+                # Wait between redeems so nonce clears on-chain
+                await asyncio.sleep(5)
+
+            return {"redeemed": redeemed, "failed": failed,
+                    "total_redeemed_usd": total_usd}
+
+        except Exception as e:
+            logger.error("Auto-redeem error: %s", e)
+            print(f"⚠️ Auto-redeem error: {e}", flush=True)
+            return {"redeemed": 0, "total_redeemed_usd": 0}
+
+    # ─── Position discovery ───────────────────────────────────────────
+
+    async def _get_conditional_positions(self) -> Dict[str, float]:
+        """Find all conditional token positions on the wallet.
+
+        Queries BOTH Gamma API and data-api, merges results.
+        Uses pagination to avoid missing positions.
+        
+        Returns dict: {token_id: {"size": float, "condition_id": str, "neg_risk": bool, "title": str}}
+        If data-api provides conditionId/redeemable, we use those directly
+        (skipping the slow per-token Gamma lookup in check_and_redeem).
+        """
+        try:
+            import requests
+
+            address = self._proxy_wallet or self._signer_address
+            if not address:
+                return {}
+
+            positions = {}
+
+            # ── Source 1: data-api (PREFERRED — has conditionId, redeemable, negativeRisk) ──
+            try:
+                offset = 0
+                page_size = 100
+                while True:
+                    resp = requests.get(
+                        "https://data-api.polymarket.com/positions",
+                        params={
+                            "user": address.lower(),
+                            "sizeThreshold": 0,
+                            "limit": page_size,
+                            "offset": offset,
+                        },
+                        timeout=15,
+                    )
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json()
+                    if not isinstance(data, list) or not data:
+                        break
+                    for pos in data:
+                        token_id = pos.get("asset", pos.get("token_id", ""))
+                        size = float(pos.get("size", pos.get("balance", 0)))
+                        if not token_id or size <= 0:
+                            continue
+                        # Store rich metadata from data-api
+                        existing = positions.get(token_id)
+                        positions[token_id] = {
+                            "size": max(size, existing["size"] if existing else 0),
+                            "condition_id": pos.get("conditionId", existing.get("condition_id", "") if existing else ""),
+                            "neg_risk": pos.get("negativeRisk", existing.get("neg_risk", False) if existing else False),
+                            "redeemable": pos.get("redeemable", existing.get("redeemable", False) if existing else False),
+                            "title": pos.get("title", existing.get("title", "") if existing else ""),
+                            "cur_price": pos.get("curPrice", existing.get("cur_price") if existing else None),
+                        }
+                    if len(data) < page_size:
+                        break
+                    offset += page_size
+            except Exception as e:
+                print(f"  ⚠️ data-api positions query: {e}", flush=True)
+
+            # ── Source 2: Gamma API (fallback — merge positions missing from data-api) ──
+            try:
+                offset = 0
+                page_size = 100
+                while True:
+                    resp = requests.get(
+                        f"{GAMMA_API_URL}/positions",
+                        params={
+                            "user": address.lower(),
+                            "limit": page_size,
+                            "offset": offset,
+                        },
+                        timeout=15,
+                    )
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json()
+                    if not isinstance(data, list) or not data:
+                        break
+                    for pos in data:
+                        token_id = pos.get("asset", pos.get("token_id", ""))
+                        size = float(pos.get("size", pos.get("balance", 0)))
+                        if not token_id or size <= 0:
+                            continue
+                        if token_id not in positions:
+                            positions[token_id] = {
+                                "size": size,
+                                "condition_id": "",
+                                "neg_risk": False,
+                                "redeemable": False,
+                                "title": "",
+                                "cur_price": None,
+                            }
+                        else:
+                            positions[token_id]["size"] = max(
+                                positions[token_id]["size"], size
+                            )
+                    if len(data) < page_size:
+                        break
+                    offset += page_size
+            except Exception as e:
+                print(f"  ⚠️ Gamma positions query: {e}", flush=True)
+
+            if positions:
+                redeemable_count = sum(1 for p in positions.values() if p.get("redeemable"))
+                print(f"  📋 Found {len(positions)} positions ({redeemable_count} redeemable)",
+                      flush=True)
+
+            return positions
+
+        except Exception as e:
+            logger.error("Get positions failed: %s", e)
+            return {}
+
+    async def _get_market_for_token(self, token_id: str) -> Optional[Dict]:
+        """Look up market info for a token ID via Gamma API."""
+        try:
+            import requests
+
+            resp = requests.get(
+                f"{GAMMA_API_URL}/markets",
+                params={"clob_token_ids": token_id},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+
+            # Fallback parameter name
+            resp = requests.get(
+                f"{GAMMA_API_URL}/markets",
+                params={"token_id": token_id},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+        except Exception as e:
+            logger.debug("Market lookup failed: %s", e)
+        return None
+
+    # ─── Redemption dispatch ──────────────────────────────────────────
+
+    async def _redeem(self, condition_id: str, neg_risk: bool) -> bool:
+        """Redeem using best method. Relayer first, direct on-chain fallback."""
+        # Try gasless relayer first
+        if self._relayer:
+            ok = await self._redeem_via_relayer(condition_id, neg_risk)
+            if ok:
+                return True
+            print(f"  ⚠️ Relayer failed, trying direct on-chain...", flush=True)
+
+        # Fallback: direct on-chain
+        if self._w3:
+            if self.sig_type == 2 and self._proxy_wallet:
+                return await self._redeem_via_safe(condition_id, neg_risk)
+            else:
+                return await self._redeem_via_eoa(condition_id, neg_risk)
+
+        return False
+
+    @staticmethod
+    def _build_redeem_calldata(condition_id: str, neg_risk: bool) -> tuple:
+        """Build redeemPositions calldata + target address.
+        
+        Returns: (calldata_bytes, target_address_str)
+        """
+        from web3 import Web3
+        from eth_abi import encode
+
+        cond_bytes = bytes.fromhex(
+            condition_id[2:] if condition_id.startswith("0x") else condition_id
+        )
+
+        if neg_risk:
+            selector = Web3.keccak(text="redeemPositions(bytes32,uint256[])")[:4]
+            params = encode(["bytes32", "uint256[]"],
+                            [cond_bytes, [2**256 - 1, 2**256 - 1]])
+            return selector + params, NEG_RISK_ADAPTER
+        else:
+            selector = Web3.keccak(
+                text="redeemPositions(address,bytes32,bytes32,uint256[])"
+            )[:4]
+            params = encode(
+                ["address", "bytes32", "bytes32", "uint256[]"],
+                [PUSD_ADDRESS, b"\x00" * 32, cond_bytes, [1, 2]]
+            )
+            return selector + params, CTF_ADDRESS
+
+    # ─── Method 1: Gasless builder relayer ────────────────────────────
+
+    async def _redeem_via_relayer(self, condition_id: str, neg_risk: bool) -> bool:
+        """Redeem via Polymarket builder relayer (gasless, needs POLY_BUILDER_*)."""
+        if not self._relayer:
+            return False
+        try:
+            from py_builder_relayer_client.models import SafeTransaction, OperationType
+
+            calldata, target = self._build_redeem_calldata(condition_id, neg_risk)
+
+            tx = SafeTransaction(
+                to=target, operation=OperationType.Call,
+                data="0x" + calldata.hex(), value="0",
+            )
+
+            resp = self._relayer.execute([tx], "Redeem positions")
+            tx_id = getattr(resp, 'transaction_id', str(resp))
+            print(f"  📨 Relayer submitted: {tx_id}", flush=True)
+
+            for _ in range(20):
+                await asyncio.sleep(3)
+                try:
+                    status = self._relayer.get_transaction(tx_id)
+                    if isinstance(status, list):
+                        status = status[0] if status else {}
+                    state = (status.get("state", "") if isinstance(status, dict)
+                             else str(status))
+                    if "CONFIRMED" in state.upper():
+                        return True
+                    if "FAILED" in state.upper() or "INVALID" in state.upper():
+                        return False
+                except Exception:
+                    continue
+
+            print("  ⏰ Relayer timeout — may still confirm on-chain", flush=True)
+            return False
+
+        except Exception as e:
+            print(f"  ❌ Relayer redeem error: {e}", flush=True)
+            return False
+
+    # ─── Pending-tx cleanup ──────────────────────────────────────────
+
+    async def _clear_pending_txs(self) -> bool:
+        """Cancel stuck pending txs with a single high-gas self-transfer.
+
+        If pending nonce > confirmed nonce, there are stuck txs in the
+        mempool.  Send ONE 0-value self-transfer at the confirmed nonce
+        with very high gas to replace the stuck tx.  Once it confirms,
+        all queued txs behind it are dropped (stale nonce).
+
+        Returns True if clear (no stuck txs or successfully cancelled).
+        """
+        if not self._w3:
+            return True
+
+        try:
+            from eth_account import Account
+            w3 = self._w3
+            acct = Account.from_key(self._private_key)
+
+            confirmed = w3.eth.get_transaction_count(acct.address, 'latest')
+            pending = w3.eth.get_transaction_count(acct.address, 'pending')
+
+            if pending <= confirmed:
+                return True  # Nothing stuck
+
+            stuck = pending - confirmed
+            print(f"⚠️ {stuck} stuck pending tx(s) at nonce {confirmed}+. "
+                  f"Sending cancel tx...", flush=True)
+
+            # Very high gas to guarantee replacement (prior stuck txs
+            # used 25-50 gwei tips; we use 75)
+            gas_price = w3.eth.gas_price
+            cancel_tip = w3.to_wei(75, 'gwei')
+            cancel_max = gas_price + cancel_tip
+            cancel_max = max(cancel_max, w3.to_wei(150, 'gwei'))
+
+            # Simple transfer = 21k gas, cheap enough
+            cancel_cost = 21_000 * cancel_max
+            balance = w3.eth.get_balance(acct.address)
+            if balance < cancel_cost:
+                print(f"  ⛽ Can't afford cancel tx "
+                      f"({cancel_cost / 1e18:.4f} POL > "
+                      f"{balance / 1e18:.4f} POL)", flush=True)
+                return False
+
+            tx = {
+                'from': acct.address,
+                'to': acct.address,  # Self-transfer (cancel)
+                'value': 0,
+                'nonce': confirmed,
+                'gas': 21_000,
+                'maxFeePerGas': cancel_max,
+                'maxPriorityFeePerGas': cancel_tip,
+                'chainId': 137,
+            }
+
+            signed = w3.eth.account.sign_transaction(tx, self._private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"  📨 Cancel tx: {tx_hash.hex()} "
+                  f"(nonce={confirmed}, tip={cancel_tip / 1e9:.0f} gwei)",
+                  flush=True)
+
+            loop = asyncio.get_event_loop()
+            receipt = await loop.run_in_executor(
+                None,
+                lambda: w3.eth.wait_for_transaction_receipt(
+                    tx_hash, timeout=90
+                )
+            )
+
+            if receipt['status'] == 1:
+                print(f"  ✅ Stuck txs cleared! "
+                      f"(gas used: {receipt['gasUsed']})", flush=True)
+                return True
+            else:
+                print(f"  ❌ Cancel tx reverted", flush=True)
+                return False
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            if 'nonce too low' in err_msg:
+                # Stuck tx confirmed while we were building — all clear
+                print(f"  ✅ Stuck tx already confirmed, queue clear",
+                      flush=True)
+                return True
+            if 'already known' in err_msg:
+                # Our cancel is already in mempool — wait for it
+                print(f"  ⏳ Cancel tx already in mempool, waiting...",
+                      flush=True)
+                await asyncio.sleep(15)
+                return True
+            print(f"  ⚠️ Clear pending txs error: {e}", flush=True)
+            return False
+
+    # ─── Generic Safe transaction execution ─────────────────────────
+
+    async def _execute_via_safe(self, target: str, inner_data: bytes,
+                                gas_limit: int = 300_000,
+                                label: str = "Safe tx") -> bool:
+        """Execute an arbitrary call through the Gnosis Safe.
+
+        Signs an EIP-712 Safe transaction and submits on-chain.
+        Costs ~0.004 POL gas.  Used for redeem, setApprovalForAll, etc.
+        
+        Pre-checks:
+        - EOA has enough MATIC (estimated gas cost + 20% margin)
+        - No pending txs in mempool (waits or skips)
+        """
+        if not self._w3:
+            return False
+
+        try:
+            from web3 import Web3
+            from eth_account import Account
+
+            w3 = self._w3
+            safe_addr = Web3.to_checksum_address(self._proxy_wallet)
+            target = Web3.to_checksum_address(target)
+            acct = Account.from_key(self._private_key)
+
+            # ── Pre-flight: get confirmed nonce ──
+            confirmed_nonce = w3.eth.get_transaction_count(acct.address, 'latest')
+
+            # ── Gas pricing: real-time from network ──
+            # Polygon gas fluctuates widely (30-300+ gwei).
+            # Use actual gas_price + small buffer. NO hard cap — the
+            # network sets the price, we just need to match it.
+            gas_price = w3.eth.gas_price  # Real-time from Alchemy
+            max_fee = gas_price + w3.to_wei(25, 'gwei')  # Must cover 25 gwei min tip
+            max_fee = max(max_fee, w3.to_wei(50, 'gwei'))  # Floor at 50 gwei
+
+            # ── Pre-flight: check MATIC balance vs estimated cost ──
+            estimated_cost = gas_limit * max_fee
+            matic_balance = w3.eth.get_balance(acct.address)
+            if matic_balance < estimated_cost * 12 // 10:  # Need 120% of estimate
+                matic_eth = matic_balance / 1e18
+                cost_eth = estimated_cost / 1e18
+                print(f"  ⛽ Insufficient MATIC: {matic_eth:.4f} POL < "
+                      f"{cost_eth:.4f} POL needed. Send MATIC to {acct.address}", flush=True)
+                return False
+
+            # ── Get Safe nonce ──
+            nonce = await self._get_safe_nonce(safe_addr)
+            if nonce is None:
+                print(f"  ❌ Could not read Safe nonce", flush=True)
+                return False
+
+            # ── Compute EIP-712 Safe transaction hash ──
+            zero_addr = "0x" + "00" * 20
+            safe_tx_hash = self._compute_safe_tx_hash(
+                safe_addr, target, 0, inner_data, 0,
+                0, 0, 0, zero_addr, zero_addr, nonce,
+            )
+
+            # ── ECDSA sign ──
+            signed = acct.unsafe_sign_hash(safe_tx_hash)
+            sig_bytes = (signed.r.to_bytes(32, 'big') +
+                         signed.s.to_bytes(32, 'big') +
+                         bytes([signed.v]))
+
+            # ── Build Safe.execTransaction call ──
+            exec_abi = [{
+                "name": "execTransaction", "type": "function",
+                "inputs": [
+                    {"name": "to",             "type": "address"},
+                    {"name": "value",          "type": "uint256"},
+                    {"name": "data",           "type": "bytes"},
+                    {"name": "operation",      "type": "uint8"},
+                    {"name": "safeTxGas",      "type": "uint256"},
+                    {"name": "baseGas",        "type": "uint256"},
+                    {"name": "gasPrice",       "type": "uint256"},
+                    {"name": "gasToken",       "type": "address"},
+                    {"name": "refundReceiver", "type": "address"},
+                    {"name": "signatures",     "type": "bytes"},
+                ],
+                "outputs": [{"name": "", "type": "bool"}],
+            }]
+
+            safe = w3.eth.contract(address=safe_addr, abi=exec_abi)
+            priority_fee = min(w3.to_wei(25, 'gwei'), max_fee - 1)  # Polygon min 25 gwei
+            eoa_nonce = confirmed_nonce
+
+            tx_data = safe.functions.execTransaction(
+                target, 0, inner_data, 0,
+                0, 0, 0, zero_addr, zero_addr, sig_bytes,
+            ).build_transaction({
+                'from': acct.address,
+                'nonce': eoa_nonce,
+                'gas': gas_limit,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'chainId': 137,
+            })
+
+            signed_tx = w3.eth.account.sign_transaction(tx_data, self._private_key)
+            try:
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            except Exception as send_err:
+                err_msg = str(send_err).lower()
+                if 'insufficient funds' in err_msg:
+                    print(f"  ⛽ {label}: insufficient funds (queued txs consuming balance). "
+                          f"Will retry next cycle.", flush=True)
+                    return False
+                elif 'replacement' in err_msg and 'underpriced' in err_msg:
+                    # Stuck pending tx at same nonce — bump gas aggressively
+                    bumped_fee = max_fee * 3
+                    bumped_tip = min(w3.to_wei(75, 'gwei'), bumped_fee - 1)
+                    print(f"  ⚠️ Replacing stuck tx at nonce {eoa_nonce} "
+                          f"(gas {max_fee/1e9:.0f}→{bumped_fee/1e9:.0f} gwei)...", flush=True)
+                    tx_data['maxFeePerGas'] = bumped_fee
+                    tx_data['maxPriorityFeePerGas'] = bumped_tip
+                    signed_tx = w3.eth.account.sign_transaction(tx_data, self._private_key)
+                    try:
+                        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    except Exception as retry_err:
+                        print(f"  ❌ {label}: replacement also failed: {retry_err}", flush=True)
+                        return False
+                elif 'nonce too low' in err_msg:
+                    # Prior tx already confirmed — use next nonce
+                    print(f"  ⚠️ Nonce already used, retrying with {eoa_nonce + 1}...", flush=True)
+                    tx_data['nonce'] = eoa_nonce + 1
+                    signed_tx = w3.eth.account.sign_transaction(tx_data, self._private_key)
+                    try:
+                        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    except Exception as retry_err:
+                        print(f"  ❌ {label}: nonce retry also failed: {retry_err}", flush=True)
+                        return False
+                elif 'already known' in err_msg:
+                    # Same tx already in mempool — compute hash and wait
+                    print(f"  ⚠️ Tx already in mempool, waiting for it...", flush=True)
+                    tx_hash = w3.keccak(signed_tx.raw_transaction)
+                else:
+                    raise
+
+            print(f"  📨 {label}: {tx_hash.hex()}", flush=True)
+
+            # ── Wait for receipt (try multiple RPCs if primary times out) ──
+            receipt = await self._wait_for_receipt(tx_hash, eoa_nonce, acct.address)
+
+            if receipt is None:
+                print(f"  ⚠️ {label}: tx sent but receipt unconfirmed "
+                      f"(may still land on-chain)", flush=True)
+                return False
+
+            if receipt['status'] == 1:
+                print(f"  ✅ {label} confirmed (gas: {receipt['gasUsed']}, "
+                      f"block {receipt['blockNumber']})", flush=True)
+                return True
+            else:
+                print(f"  ❌ {label} reverted (block {receipt['blockNumber']})", flush=True)
+                return False
+
+        except Exception as e:
+            print(f"  ❌ {label} error: {e}", flush=True)
+            traceback.print_exc()
+            return False
+
+    async def _wait_for_receipt(self, tx_hash, eoa_nonce: int,
+                                 eoa_address: str,
+                                 timeout: int = 180) -> Optional[dict]:
+        """Wait for tx receipt, trying multiple RPCs on timeout.
+
+        If the primary RPC can't find the receipt, fall back to other RPCs.
+        Also checks if the nonce has advanced (meaning the tx WAS mined even
+        if we can't get the specific receipt).
+        """
+        from web3 import Web3
+
+        loop = asyncio.get_event_loop()
+
+        # ── Try primary RPC first (180s) ──
+        try:
+            receipt = await loop.run_in_executor(
+                None,
+                lambda: self._w3.eth.wait_for_transaction_receipt(
+                    tx_hash, timeout=timeout
+                )
+            )
+            return receipt
+        except Exception as primary_err:
+            print(f"  ⏳ Primary RPC timeout ({timeout}s), trying fallbacks...",
+                  flush=True)
+
+        # ── Try each fallback RPC ──
+        for rpc_url in DEFAULT_RPCS:
+            try:
+                fallback_w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={
+                    'timeout': 30
+                }))
+                receipt = fallback_w3.eth.get_transaction_receipt(tx_hash)
+                if receipt:
+                    print(f"  ✅ Receipt found via {rpc_url}", flush=True)
+                    return receipt
+            except Exception:
+                continue
+
+        # ── Check if nonce advanced (tx was mined but receipt unavailable) ──
+        try:
+            current_nonce = self._w3.eth.get_transaction_count(eoa_address)
+            if current_nonce > eoa_nonce:
+                print(f"  ⚠️ Nonce advanced ({eoa_nonce}→{current_nonce}), "
+                      f"tx likely mined but receipt unavailable", flush=True)
+                # Return a synthetic success — the tx DID execute
+                return {'status': 1, 'gasUsed': 0, 'blockNumber': 0}
+        except Exception:
+            pass
+
+        return None
+
+    # ─── Method 2: Direct on-chain via Gnosis Safe execTransaction ───
+
+    async def _redeem_via_safe(self, condition_id: str, neg_risk: bool) -> bool:
+        """Redeem via Safe.execTransaction → CTF.redeemPositions."""
+        inner_data, target_str = self._build_redeem_calldata(condition_id, neg_risk)
+        return await self._execute_via_safe(
+            target_str, inner_data, gas_limit=300_000, label="Redeem"
+        )
+
+    def _get_usdc_balance(self) -> float:
+        """Read USDC.e balance of proxy wallet (or EOA). Returns dollar amount."""
+        try:
+            from web3 import Web3
+            w3 = self._w3
+            owner = self._proxy_wallet or self._signer_address
+            if not owner or not w3:
+                return 0.0
+            # balanceOf(address) selector = 0x70a08231
+            owner_hex = owner.lower().replace('0x', '').zfill(64)
+            result = w3.eth.call({
+                'to': Web3.to_checksum_address(PUSD_ADDRESS),
+                'data': f'0x70a08231{owner_hex}',
+            })
+            raw = int.from_bytes(result, 'big')
+            return raw / 1e6  # USDC has 6 decimals
+        except Exception:
+            return 0.0
+
+    async def _get_safe_nonce(self, safe_addr: str) -> Optional[int]:
+        """Read the current nonce from the Gnosis Safe contract."""
+        try:
+            result = self._w3.eth.call({
+                'to': safe_addr,
+                'data': SAFE_NONCE_SELECTOR,
+            })
+            return int.from_bytes(result, 'big')
+        except Exception as e:
+            print(f"  ⚠️ Safe nonce read error: {e}", flush=True)
+            return None
+
+    def _compute_safe_tx_hash(self, safe_addr: str, to: str, value: int,
+                               data: bytes, operation: int,
+                               safe_tx_gas: int, base_gas: int, gas_price: int,
+                               gas_token: str, refund_receiver: str,
+                               nonce: int) -> bytes:
+        """Compute the EIP-712 Safe transaction hash for signing.
+
+        Matches GnosisSafe.getTransactionHash() exactly.
+        """
+        from web3 import Web3
+
+        # Step 1: Struct hash
+        data_hash = Web3.keccak(data)
+        encoded = (
+            SAFE_TX_TYPEHASH +
+            bytes.fromhex(to[2:].lower().zfill(64)) +
+            value.to_bytes(32, 'big') +
+            data_hash +
+            operation.to_bytes(32, 'big') +
+            safe_tx_gas.to_bytes(32, 'big') +
+            base_gas.to_bytes(32, 'big') +
+            gas_price.to_bytes(32, 'big') +
+            bytes.fromhex(gas_token[2:].lower().zfill(64)) +
+            bytes.fromhex(refund_receiver[2:].lower().zfill(64)) +
+            nonce.to_bytes(32, 'big')
+        )
+        safe_tx_hash = Web3.keccak(encoded)
+
+        # Step 2: Domain separator
+        domain_data = (
+            DOMAIN_SEPARATOR_TYPEHASH +
+            (137).to_bytes(32, 'big') +     # chainId = Polygon
+            bytes.fromhex(safe_addr[2:].lower().zfill(64))
+        )
+        domain_separator = Web3.keccak(domain_data)
+
+        # Step 3: EIP-712 final hash = keccak256("\x19\x01" || domainSep || structHash)
+        return Web3.keccak(b"\x19\x01" + domain_separator + safe_tx_hash)
+
+    # ─── Method 3: Direct EOA (no Safe wrapper) ──────────────────────
+
+    async def _redeem_via_eoa(self, condition_id: str, neg_risk: bool) -> bool:
+        """Redeem directly on CTF contract (for EOA wallets, not proxy)."""
+        if not self._w3:
+            return False
+
+        try:
+            from web3 import Web3
+            from eth_account import Account
+
+            w3 = self._w3
+            acct = Account.from_key(self._private_key)
+            calldata, target_str = self._build_redeem_calldata(condition_id, neg_risk)
+            target = Web3.to_checksum_address(target_str)
+
+            gas_price = w3.eth.gas_price
+            max_fee = max(gas_price * 2, w3.to_wei(35, 'gwei'))
+            priority_fee = min(w3.to_wei(30, 'gwei'), max_fee - 1)
+
+            tx = {
+                'from': acct.address,
+                'to': target,
+                'data': '0x' + calldata.hex(),
+                'nonce': w3.eth.get_transaction_count(acct.address),
+                'gas': 200_000,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'chainId': 137,
+                'value': 0,
+            }
+
+            signed_tx = w3.eth.account.sign_transaction(tx, self._private_key)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            print(f"  📨 EOA tx sent: {tx_hash.hex()}", flush=True)
+
+            loop = asyncio.get_event_loop()
+            receipt = await loop.run_in_executor(
+                None,
+                lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            )
+
+            if receipt['status'] == 1:
+                print(f"  ✅ EOA redeem confirmed (gas: {receipt['gasUsed']})", flush=True)
+                return True
+            else:
+                print(f"  ❌ EOA redeem reverted", flush=True)
+                return False
+
+        except Exception as e:
+            print(f"  ❌ EOA redeem error: {e}", flush=True)
+            return False
+
+    # ─── CTF Exchange Approval ─────────────────────────────────────────
+
+    async def ensure_ctf_approval(self, force: bool = False) -> bool:
+        """Check and fix CTF exchange approval for selling.
+
+        Sell orders require the CTF contract to have `setApprovalForAll`
+        for both the Normal and NegRisk exchanges.  If not approved, this
+        method sends the approval transactions on-chain via the Safe.
+
+        Args:
+            force: If True, send setApprovalForAll even if already approved.
+                   Useful when on-chain check says approved but CLOB disagrees.
+
+        Returns True if all approvals are OK (already set or newly set).
+        """
+        if not self._w3 and not self._relayer:
+            return False
+
+        # ── Clear any stuck pending txs first (only if using on-chain) ──
+        if self._w3:
+            cleared = await self._clear_pending_txs()
+            if not cleared and not self._relayer:
+                print("⚠️ Could not clear stuck txs — skipping approvals", flush=True)
+                return False
+
+        from web3 import Web3
+        from eth_abi import encode
+
+        CTF = Web3.to_checksum_address(CTF_ADDRESS)
+        owner = Web3.to_checksum_address(self._proxy_wallet)
+
+        EXCHANGES = {
+            'Normal':  '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+            'NegRisk': '0xC5d563A36AE78145C45a50134d48A1215220f80a',
+        }
+
+        # isApprovedForAll(address,address) selector = 0xe985e9c5
+        all_ok = True
+        for label, exchange in EXCHANGES.items():
+            try:
+                needs_approval = force
+
+                if not force and self._w3:
+                    owner_pad = owner.lower().replace('0x', '').zfill(64)
+                    op_pad = exchange.lower().replace('0x', '').zfill(64)
+                    result = self._w3.eth.call({
+                        'to': CTF,
+                        'data': f'0xe985e9c5{owner_pad}{op_pad}',
+                    })
+                    approved = int.from_bytes(result, 'big') == 1
+
+                    if approved:
+                        print(f"✅ CTF approval ({label}): approved", flush=True)
+                        continue
+                    needs_approval = True
+                elif not force:
+                    # No web3 to check — assume needs approval
+                    needs_approval = True
+
+                if needs_approval:
+                    action = "Force re-approving" if force else "NOT approved — fixing"
+                    print(f"⚠️ CTF approval ({label}): {action} on-chain...",
+                          flush=True)
+
+                    # setApprovalForAll(address,bool) selector = 0xa22cb465
+                    selector = bytes.fromhex('a22cb465')
+                    calldata = selector + encode(
+                        ['address', 'bool'],
+                        [Web3.to_checksum_address(exchange), True]
+                    )
+
+                # Try gasless relayer first for approval
+                ok = False
+                if self._relayer:
+                    try:
+                        from py_builder_relayer_client.models import SafeTransaction, OperationType
+                        rtx = SafeTransaction(
+                            to=CTF_ADDRESS, operation=OperationType.Call,
+                            data="0x" + calldata.hex(), value="0",
+                        )
+                        resp = self._relayer.execute([rtx], f"Approve {label}")
+                        tx_id = getattr(resp, 'transaction_id', str(resp))
+                        print(f"  📨 Relayer approval ({label}): {tx_id}", flush=True)
+                        for _ in range(15):
+                            await asyncio.sleep(3)
+                            try:
+                                status = self._relayer.get_transaction(tx_id)
+                                if isinstance(status, list):
+                                    status = status[0] if status else {}
+                                state = (status.get("state", "") if isinstance(status, dict)
+                                         else str(status))
+                                if "CONFIRMED" in state.upper():
+                                    ok = True
+                                    break
+                                if "FAILED" in state.upper() or "INVALID" in state.upper():
+                                    break
+                            except Exception:
+                                continue
+                        if ok:
+                            pass  # fall through to success check below
+                        else:
+                            print(f"  ⚠️ Relayer approval failed, trying direct...",
+                                  flush=True)
+                    except Exception as re:
+                        print(f"  ⚠️ Relayer approval error: {re}, trying direct...",
+                              flush=True)
+
+                # Fallback: direct on-chain
+                if not ok and self._w3:
+                    if self.sig_type == 2 and self._proxy_wallet:
+                        ok = await self._execute_via_safe(
+                            CTF_ADDRESS, calldata, gas_limit=120_000,
+                            label=f"Approve {label}"
+                        )
+                    else:
+                        ok = await self._execute_eoa_call(
+                            CTF_ADDRESS, calldata, gas_limit=120_000,
+                            label=f"Approve {label}"
+                        )
+
+                if ok:
+                    print(f"✅ CTF approval ({label}): now approved!", flush=True)
+                else:
+                    print(f"❌ CTF approval ({label}): tx failed!", flush=True)
+                    all_ok = False
+
+            except Exception as e:
+                print(f"⚠️ CTF approval check ({label}): {e}", flush=True)
+                all_ok = False
+
+        return all_ok
+
+    async def _execute_eoa_call(self, target: str, calldata: bytes,
+                                gas_limit: int = 200_000,
+                                label: str = "EOA tx") -> bool:
+        """Execute a direct EOA call (no Safe wrapper)."""
+        if not self._w3:
+            return False
+        try:
+            from web3 import Web3
+            from eth_account import Account
+            w3 = self._w3
+            acct = Account.from_key(self._private_key)
+            gas_price = w3.eth.gas_price  # Real-time
+            max_fee = gas_price + w3.to_wei(25, 'gwei')
+            max_fee = max(max_fee, w3.to_wei(50, 'gwei'))
+            priority_fee = min(w3.to_wei(25, 'gwei'), max_fee - 1)  # Polygon min 25 gwei
+            nonce = w3.eth.get_transaction_count(acct.address, 'latest')
+            tx = {
+                'from': acct.address,
+                'to': Web3.to_checksum_address(target),
+                'data': '0x' + calldata.hex(),
+                'nonce': nonce,
+                'gas': gas_limit,
+                'maxFeePerGas': max_fee,
+                'maxPriorityFeePerGas': priority_fee,
+                'chainId': 137,
+                'value': 0,
+            }
+            signed_tx = w3.eth.account.sign_transaction(tx, self._private_key)
+            try:
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            except Exception as send_err:
+                err_msg = str(send_err).lower()
+                if 'insufficient funds' in err_msg:
+                    print(f"  ⛽ {label}: insufficient funds. Will retry next cycle.", flush=True)
+                    return False
+                elif 'replacement' in err_msg and 'underpriced' in err_msg:
+                    bumped_fee = max_fee * 3
+                    bumped_tip = min(w3.to_wei(75, 'gwei'), bumped_fee - 1)
+                    print(f"  ⚠️ Replacing stuck tx at nonce {nonce} "
+                          f"(gas {max_fee/1e9:.0f}→{bumped_fee/1e9:.0f} gwei)...", flush=True)
+                    tx['maxFeePerGas'] = bumped_fee
+                    tx['maxPriorityFeePerGas'] = bumped_tip
+                    signed_tx = w3.eth.account.sign_transaction(tx, self._private_key)
+                    try:
+                        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    except Exception as retry_err:
+                        print(f"  ❌ {label}: replacement also failed: {retry_err}", flush=True)
+                        return False
+                elif 'nonce too low' in err_msg:
+                    print(f"  ⚠️ Nonce already used, retrying with {nonce + 1}...", flush=True)
+                    tx['nonce'] = nonce + 1
+                    signed_tx = w3.eth.account.sign_transaction(tx, self._private_key)
+                    try:
+                        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    except Exception as retry_err:
+                        print(f"  ❌ {label}: nonce retry also failed: {retry_err}", flush=True)
+                        return False
+                elif 'already known' in err_msg:
+                    print(f"  ⚠️ Tx already in mempool, waiting for it...", flush=True)
+                    tx_hash = w3.keccak(signed_tx.raw_transaction)
+                else:
+                    raise
+            print(f"  📨 {label}: {tx_hash.hex()}", flush=True)
+            loop = asyncio.get_event_loop()
+            receipt = await loop.run_in_executor(
+                None,
+                lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            )
+            if receipt['status'] == 1:
+                print(f"  ✅ {label} confirmed (gas: {receipt['gasUsed']})", flush=True)
+                return True
+            else:
+                print(f"  ❌ {label} reverted", flush=True)
+                return False
+        except Exception as e:
+            print(f"  ❌ {label} error: {e}", flush=True)
+            return False
+
+    # ─── Public helpers ───────────────────────────────────────────────
+
+    async def force_check(self) -> Dict:
+        """Force an immediate check (ignores cooldown). For /redeem command."""
+        self._last_check = 0
+        return await self.check_and_redeem()
+
+    def get_status(self) -> Dict:
+        """Get auto-redeem status for debug/status commands."""
+        return {
+            "enabled": self._enabled,
+            "method": self._method,
+            "total_redeemed": self._total_redeemed,
+            "total_usd_recovered": self._total_usd_recovered,
+            "tracked_redeemed": len(self._redeemed_conditions),
+            "last_check": self._last_check,
+            "check_interval": self._check_interval,
+            "proxy_wallet": (self._proxy_wallet[:10] + "..."
+                             if self._proxy_wallet else "none"),
+            "signer": (self._signer_address[:10] + "..."
+                       if self._signer_address else "none"),
+            "errors": self._init_errors[-3:] if self._init_errors else [],
+        }
