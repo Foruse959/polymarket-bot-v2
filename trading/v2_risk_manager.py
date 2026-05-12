@@ -68,34 +68,37 @@ class BalanceTier:
         return self.min_bal <= balance < self.max_bal
 
 
-# Tier definitions — CALIBRATED for low-balance users
+# Tier definitions — LOWERED REQUIREMENTS (beast mode upgrade)
+# Rationale: original thresholds too strict for real market conditions,
+# bot was skipping 90%+ of valid signals. Lowered to trade more often
+# while still maintaining quality via confidence + Kelly sizing.
 TIERS = [
     BalanceTier(
         "SURVIVAL", "🛡️", 0.0, 5.0,
         bet_pct_range=(15.0, 25.0),   # 15-25% of tiny balance
-        min_confidence=0.70,
-        max_positions=1,
-        min_agreement=4,               # Need 4+ strategies agreeing
+        min_confidence=0.65,
+        max_positions=2,
+        min_agreement=2,               # Was 4, now 2 (still needs confirmation)
         reserve=0.0,
-        description="Ultra-low balance — only HIGHEST conviction (4+ agree, 70%+ conf)"
+        description="Ultra-low balance — needs 2+ strategies agreeing (65%+ conf)"
     ),
     BalanceTier(
         "SEED", "🌱", 5.0, 15.0,
         bet_pct_range=(10.0, 18.0),
-        min_confidence=0.65,
-        max_positions=3,
-        min_agreement=3,               # 3+ strategies
+        min_confidence=0.60,
+        max_positions=4,
+        min_agreement=2,               # Was 3, now 2
         reserve=1.0,
-        description="Seed capital — top-tier signals only (3+ agree, 65%+ conf)"
+        description="Seed capital — solid signals (2+ agree, 60%+ conf)"
     ),
     BalanceTier(
         "COMFORT", "⚖️", 15.0, 50.0,
         bet_pct_range=(4.0, 8.0),
-        min_confidence=0.58,
-        max_positions=5,
-        min_agreement=2,               # 2+ strategies
+        min_confidence=0.55,
+        max_positions=6,
+        min_agreement=1,               # Was 2, now 1 (all signals OK at this tier)
         reserve=5.0,
-        description="Comfortable — solid signals (2+ agree, 58%+ conf)"
+        description="Comfortable — all signals welcome (1+ agree, 55%+ conf)"
     ),
     BalanceTier(
         "AGGRESSIVE", "🔥", 50.0, 150.0,

@@ -41,11 +41,37 @@ class SignalRanker:
         strategies_fired = 0
         errors_per_strategy = defaultdict(int)
 
+        # ═══ SPEED OPTIMIZATION: Pre-fetch all orderbooks in parallel ═══
+        # Instead of each strategy making its own API calls (120+ per scan),
+        # we fetch ALL token orderbooks ONCE in parallel, then serve from cache.
+        market_cache = context.get('market_cache')
+        clob = context.get('clob')
+        if market_cache:
+            all_tokens = []
+            for m in markets:
+                up = m.get('up_token_id')
+                down = m.get('down_token_id')
+                if up:
+                    all_tokens.append(up)
+                if down:
+                    all_tokens.append(down)
+            if all_tokens:
+                await market_cache.prefetch_scan(all_tokens)
+                self.log('DEBUG', f"Prefetched {len(set(all_tokens))} token orderbooks "
+                                  f"(scan #{market_cache._scan_id})")
+
+            # Swap clob with CachedClobProxy so strategies read from cache
+            from data.market_cache import CachedClobProxy
+            cached_clob = CachedClobProxy(market_cache, clob)
+        else:
+            cached_clob = clob  # fallback: no cache available
+
         for market in markets:
             timeframe = market.get('timeframe', 5)
             # Inject seconds_remaining into context for this market
             ctx = dict(context)
             ctx['seconds_remaining'] = market.get('seconds_remaining', 300)
+            ctx['clob'] = cached_clob  # strategies use cache-backed proxy
 
             for strategy in self.strategies:
                 if timeframe not in strategy.get_suitable_timeframes():

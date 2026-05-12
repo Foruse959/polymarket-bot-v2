@@ -173,30 +173,63 @@ class ClobClient:
             pass
         return {'balance': '0', 'allowance': '0'}
 
+    # Fallback RPC endpoints (tried in order if primary fails)
+    _RPC_FALLBACKS = [
+        "https://polygon-bor-rpc.publicnode.com",
+        "https://rpc.ankr.com/polygon",
+        "https://1rpc.io/matic",
+        "https://polygon.llamarpc.com",
+        "https://polygon-rpc.com",
+    ]
+
     def get_pusd_balance_onchain(self, wallet_address: str) -> Optional[float]:
-        """Read pUSD balance directly from Polygon RPC (no API key needed)."""
+        """
+        Read pUSD balance directly from Polygon RPC (no API key needed).
+        
+        Tries user-configured RPC first, then 5 public fallbacks in order.
+        Returns None only if ALL endpoints fail.
+        """
         if not wallet_address:
             return None
+
         try:
             from web3 import Web3
-            rpc = Config.POLYGON_RPC_URL or "https://polygon-rpc.com"
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 10}))
-            if not w3.is_connected():
-                return None
-            erc20_abi = [{
-                "constant": True, "inputs": [{"name": "_owner", "type": "address"}],
-                "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
-                "type": "function"
-            }]
-            contract = w3.eth.contract(
-                address=Web3.to_checksum_address(Config.PUSD_CONTRACT),
-                abi=erc20_abi
-            )
-            raw = contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
-            return raw / 1e6  # pUSD has 6 decimals
-        except Exception as e:
-            print(f"[CLOB] On-chain pUSD read failed: {e}", flush=True)
+        except ImportError:
+            print(f"[CLOB] web3 not installed, skipping on-chain balance", flush=True)
             return None
+
+        erc20_abi = [{
+            "constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+            "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
+            "type": "function"
+        }]
+
+        # Build RPC list: user-configured first, then fallbacks
+        rpcs = []
+        if Config.POLYGON_RPC_URL:
+            rpcs.append(Config.POLYGON_RPC_URL)
+        rpcs.extend([r for r in self._RPC_FALLBACKS if r not in rpcs])
+
+        last_error = None
+        for rpc in rpcs:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
+                if not w3.is_connected():
+                    continue
+                contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(Config.PUSD_CONTRACT),
+                    abi=erc20_abi
+                )
+                raw = contract.functions.balanceOf(
+                    Web3.to_checksum_address(wallet_address)
+                ).call()
+                return raw / 1e6  # pUSD has 6 decimals
+            except Exception as e:
+                last_error = f"{rpc}: {e}"
+                continue
+
+        print(f"[CLOB] All {len(rpcs)} RPC endpoints failed. Last error: {last_error}", flush=True)
+        return None
 
     # ───────────────────────────────────────────────────────────────
     # AUTH INITIALIZATION (THE CRUCIAL PART)
