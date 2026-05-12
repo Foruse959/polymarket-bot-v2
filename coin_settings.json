@@ -2,7 +2,7 @@
   "enabled_coins": [
     "BTC",
     "ETH",
-    "SOL",
-    "XRP"
+    "XRP",
+    "SOL"
   ]
 }

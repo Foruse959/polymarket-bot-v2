@@ -22,8 +22,10 @@ class SignalRanker:
     def __init__(self, log_callback=None):
         self.strategies: List[BaseStrategy] = [S() for S in ALL_STRATEGIES]
         self.log = log_callback or (lambda lvl, msg: None)
-        # Strategy weights — IndicatorFusion most trusted
+        # Strategy weights — highest backtest win rates get most weight
         self.strategy_weights = {
+            'btc_volume_sniper': 1.5,       # 86.9% backtest (BTC only)
+            'momentum_cascade': 1.3,        # 74.4% backtest
             'indicator_fusion': Config.INDICATOR_WEIGHT,  # 1.2x
             'microstructure_maker': 1.0,
             'momentum_breakout': 1.0,
