@@ -1,14 +1,14 @@
 """
-Autonomous Trade Executor — Full entry/exit automation.
+Autonomous Trade Executor — Beast Mode
 
-Handles:
-- Entry: Places order with Kelly-sized position
-- TP/SL monitoring: Checks each open position every scan
-- Auto-exit: Closes on profit target, stop loss, or time-based
-- Paper simulation: Simulates fills for testing
-- Live execution: Uses CLOB for real orders
+Full-auto entry/exit with tier-aware validation:
+- Entry: Kelly-sized + tier-aware agreement filter
+- TP/SL monitoring: checks each open position every scan
+- Auto-exit: profit target, stop loss, or time-based
+- Paper simulation: realistic fill simulation with resolution
+- Live execution: uses CLOB for real orders
 
-Logs EVERY decision with reason — nothing is silent.
+Logs EVERY decision with reason.
 """
 
 import time
@@ -22,7 +22,8 @@ from strategies.base_strategy import TradeSignal
 
 
 class Position:
-    def __init__(self, signal: TradeSignal, size_pusd: float, entry_price: float, order_id: str = None):
+    def __init__(self, signal: TradeSignal, size_pusd: float, entry_price: float,
+                 order_id: str = None):
         self.id = str(uuid.uuid4())[:8]
         self.signal = signal
         self.coin = signal.coin
@@ -38,11 +39,10 @@ class Position:
         self.opened_at = time.time()
         self.shares = size_pusd / entry_price if entry_price > 0 else 0
 
-        # TP/SL levels (from timeframe params)
         tf_params = Config.get_timeframe_params(signal.timeframe)
         self.take_profit_pct = tf_params['take_profit_pct']
         self.stop_loss_pct = tf_params['stop_loss_pct']
-        self.max_hold_seconds = signal.timeframe * 60 + 60  # Market lifetime + buffer
+        self.max_hold_seconds = signal.timeframe * 60 + 60
 
         self.current_price = entry_price
         self.pnl_pusd = 0.0
@@ -53,8 +53,11 @@ class Position:
         self.current_price = current_price
         if self.direction == 'UP':
             self.pnl_pct = (current_price - self.entry_price) / self.entry_price * 100
-        else:
+        elif self.direction in ('SELL_UP', 'SHORT'):
+            # Short position — profit when price drops
             self.pnl_pct = (self.entry_price - current_price) / self.entry_price * 100
+        else:  # DOWN
+            self.pnl_pct = (current_price - self.entry_price) / self.entry_price * 100
         self.pnl_pusd = self.size_pusd * self.pnl_pct / 100
 
     def should_exit(self) -> Optional[str]:
@@ -88,7 +91,7 @@ class Position:
 
 
 class AutonomousExecutor:
-    """Full-auto trade executor with TP/SL."""
+    """Full-auto trade executor with TP/SL monitoring."""
 
     def __init__(self, risk_mgr, clob_client, log_callback: Callable = None):
         self.risk_mgr = risk_mgr
@@ -100,7 +103,6 @@ class AutonomousExecutor:
         self.DEDUP_SECS = 15
 
     def is_dedup(self, signal: TradeSignal) -> bool:
-        """Check signal dedup window."""
         key = f"{signal.coin}_{signal.direction}_{signal.timeframe}_{signal.market_id}"
         now = time.time()
         if key in self._dedup and (now - self._dedup[key]) < self.DEDUP_SECS:
@@ -110,54 +112,51 @@ class AutonomousExecutor:
 
     async def execute_signal(self, signal: TradeSignal) -> Optional[Position]:
         """Execute a trade signal with comprehensive logging."""
-        # Dedup
         if self.is_dedup(signal):
-            self.log('DEBUG', f"🔁 DEDUP: {signal.coin} {signal.direction} — skip (recent duplicate)")
             return None
 
-        # Risk validation
+        agreement_count = signal.metadata.get('agreement_count', 1)
+        conviction_tier = signal.metadata.get('conviction_tier', 'SINGLE')
+
+        # Tier-aware validation
         ok, reason = self.risk_mgr.validate_signal(
-            signal.confidence, signal.direction, signal.coin, signal.market_id
+            signal.confidence, signal.direction,
+            signal.coin, signal.market_id,
+            agreement_count=agreement_count,
         )
         if not ok:
             self.log('RISK', f"⛔ BLOCKED: {signal.coin} {signal.direction} — {reason}")
             return None
 
-        # Position size (Kelly-based, with conviction multiplier)
-        base_size = self.risk_mgr.calculate_position_size(
-            signal.confidence, signal.strategy, signal.market_id, signal.order_type
+        # Tier-aware sizing
+        size_pusd = self.risk_mgr.calculate_position_size(
+            signal.confidence, signal.strategy, signal.market_id,
+            signal.order_type,
+            agreement_count=agreement_count,
+            conviction_tier=conviction_tier,
         )
 
-        # Boost for high-conviction
-        tier = signal.metadata.get('conviction_tier', 'SINGLE')
-        if tier == 'MAXIMUM':
-            base_size *= 1.5
-        elif tier == 'HIGH':
-            base_size *= Config.HIGH_CONVICTION_SIZE_MULTIPLIER
-
-        size_pusd = max(Config.POLYMARKET_MIN_ORDER_SIZE, min(base_size, self.risk_mgr.balance * 0.12))
-
         if size_pusd < Config.POLYMARKET_MIN_ORDER_SIZE:
-            self.log('WARN', f"⚠️ Size too small: {size_pusd:.2f} pUSD < min "
-                            f"{Config.POLYMARKET_MIN_ORDER_SIZE:.2f} — skipping")
+            self.log('WARN', f"⚠️ Size {size_pusd:.2f} < min {Config.POLYMARKET_MIN_ORDER_SIZE} — skip")
             return None
 
         entry_price = signal.limit_price or signal.entry_price
 
-        # LOG the decision comprehensively
-        self.log('TRADE', f"🎯 ENTRY: {signal.coin} {signal.direction} {tier} "
+        tier = self.risk_mgr.get_tier()
+        self.log('TRADE', f"🎯 ENTRY [{tier.emoji}{tier.name}] {signal.coin} {signal.direction} "
+                         f"[{conviction_tier}] "
                          f"size={size_pusd:.2f}pUSD @ {entry_price:.3f} "
-                         f"conf={signal.confidence:.0%} strategy={signal.strategy}")
-        self.log('TRADE', f"   Reason: {signal.rationale[:120]}")
+                         f"conf={signal.confidence:.0%} agree={agreement_count} | {signal.strategy}")
+        self.log('TRADE', f"   Reason: {signal.rationale[:140]}")
 
         # Execute (paper vs live)
         order_id = None
         if Config.is_paper():
-            self.log('PAPER', f"   📋 PAPER execution (simulated fill)")
+            self.log('PAPER', f"   📋 PAPER execution (simulated)")
             order_id = f"paper-{uuid.uuid4().hex[:8]}"
         else:
             if not self.clob.is_initialized():
-                self.log('ERROR', f"   ❌ Live mode but CLOB not initialized — skipping")
+                self.log('ERROR', f"   ❌ Live mode but CLOB not initialized")
                 return None
 
             side = 'BUY'
@@ -165,35 +164,31 @@ class AutonomousExecutor:
                 side = 'SELL'
 
             if signal.order_type == 'maker' and signal.limit_price:
-                self.log('TRADE', f"   📤 Placing LIMIT {side} @ {signal.limit_price:.3f}")
+                self.log('TRADE', f"   📤 LIMIT {side} @ {signal.limit_price:.3f}")
                 result = self.clob.place_limit_order(
-                    token_id=signal.token_id,
-                    side=side,
-                    price=signal.limit_price,
-                    size_pusd=size_pusd,
+                    token_id=signal.token_id, side=side,
+                    price=signal.limit_price, size_pusd=size_pusd,
                     expiration='GTC',
                 )
             else:
-                self.log('TRADE', f"   📤 Placing MARKET {side}")
+                self.log('TRADE', f"   📤 MARKET {side}")
                 result = self.clob.place_market_order(
-                    token_id=signal.token_id,
-                    side=side,
-                    size_pusd=size_pusd,
-                    price=signal.entry_price,
+                    token_id=signal.token_id, side=side,
+                    size_pusd=size_pusd, price=signal.entry_price,
                 )
 
             if not result:
                 self.log('ERROR', f"   ❌ Order placement FAILED")
                 return None
             order_id = result.get('order_id', 'unknown')
-            self.log('TRADE', f"   ✅ Order placed: id={order_id} status={result.get('status')}")
+            self.log('TRADE', f"   ✅ Order placed: {order_id} status={result.get('status')}")
 
         # Create position
         position = Position(signal, size_pusd, entry_price, order_id)
         self.open_positions[position.id] = position
         self.risk_mgr.register_position(signal.market_id, size_pusd)
 
-        self.log('TRADE', f"   ✅ Position opened: id={position.id} "
+        self.log('TRADE', f"   ✅ Position opened: {position.id} "
                          f"TP=+{position.take_profit_pct:.0f}% SL=-{position.stop_loss_pct:.0f}%")
         return position
 
@@ -213,17 +208,16 @@ class AutonomousExecutor:
         return closed
 
     async def _close_position(self, pid: str, reason: str):
-        """Close a position."""
         pos = self.open_positions.pop(pid, None)
         if not pos:
             return
 
         won = pos.pnl_pusd > 0
-        # Final close price is current price
         pos.status = 'closed_' + reason.split(' ')[0]
 
-        # Update risk manager
+        # Update risk manager (this records PnL and decrements open_positions)
         self.risk_mgr.record_trade_result(pos.pnl_pusd, won, pos.market_id)
+        self.risk_mgr.close_position(pos.market_id)
 
         self.closed_trades.append(pos)
         if len(self.closed_trades) > 200:

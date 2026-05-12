@@ -20,7 +20,6 @@ from .mean_reversion import MeanReversionStrategy
 from .maker_edge import MakerEdgeStrategy
 from .longshot_bias import LongshotBiasStrategy
 
-# Indicator fusion first — it's the STRONGEST signal
 ALL_STRATEGIES = [
     IndicatorFusionStrategy,
     MicrostructureMakerStrategy,
@@ -30,11 +29,6 @@ ALL_STRATEGIES = [
     MakerEdgeStrategy,
     LongshotBiasStrategy,
 ]
-
-try:
-    from .dynamic_picker import DynamicPicker
-except Exception:
-    DynamicPicker = None
 
 __all__ = [
     'BaseStrategy', 'TradeSignal', 'ALL_STRATEGIES',

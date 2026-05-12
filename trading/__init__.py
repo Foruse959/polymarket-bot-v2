@@ -1,7 +1,7 @@
-"""Trading layer for 5min_trade v2."""
+"""Trading layer for 5min_trade v2.2 Beast Mode."""
 
-from .paper_trader import PaperTrader
-from .live_trader import LiveTrader
-from .live_balance_manager import LiveBalanceManager
+from .v2_risk_manager import V2RiskManager
+from .autonomous_executor import AutonomousExecutor, Position
+from .signal_ranker import SignalRanker
 
-__all__ = ['PaperTrader', 'LiveTrader', 'LiveBalanceManager']
+__all__ = ['V2RiskManager', 'AutonomousExecutor', 'Position', 'SignalRanker']
