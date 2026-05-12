@@ -23,12 +23,14 @@ from .volume_imbalance import VolumeImbalanceStrategy
 from .mean_reversion import MeanReversionStrategy
 from .maker_edge import MakerEdgeStrategy
 from .longshot_bias import LongshotBiasStrategy
+from .oracle_lead import OracleLeadStrategy
 
 # Ordered by backtest win rate (highest first)
 ALL_STRATEGIES = [
     BTCVolumeSniperStrategy,      # 86.9% (BTC only, low volume)
     MomentumCascadeStrategy,      # 74.4% (multi-signal cascade)
     IndicatorFusionStrategy,      # ~70% (live TA indicators)
+    OracleLeadStrategy,           # 69.0% (BTC only, Binance front-run — validated Nov 2025)
     MicrostructureMakerStrategy,  # ~65% (maker-taker edge)
     MomentumBreakoutStrategy,     # 62-67% (streak-based)
     VolumeImbalanceStrategy,      # ~60% (flow detection)
@@ -43,4 +45,5 @@ __all__ = [
     'IndicatorFusionStrategy', 'MicrostructureMakerStrategy',
     'MomentumBreakoutStrategy', 'VolumeImbalanceStrategy',
     'MeanReversionStrategy', 'MakerEdgeStrategy', 'LongshotBiasStrategy',
+    'OracleLeadStrategy',
 ]

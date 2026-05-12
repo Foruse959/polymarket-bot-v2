@@ -35,6 +35,7 @@ from data.gamma_client import GammaClient
 from data.clob_client import ClobClient, ClobAuthError
 from data.price_feed import get_price_feed
 from data.market_cache import MarketCache
+from data.oracle_ws import get_oracle_ws
 from trading.v2_risk_manager import V2RiskManager
 from trading.signal_ranker import SignalRanker
 from trading.autonomous_executor import AutonomousExecutor
@@ -100,6 +101,34 @@ def add_log(level, msg):
             f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
+
+
+def add_error(msg, exc=None):
+    """
+    Log an ERROR with full stack trace when an exception is given.
+    Tracebacks are split across log entries (not truncated) so every frame
+    is visible in the dashboard and file logs.
+    """
+    add_log("ERROR", msg)
+    if exc is not None:
+        tb = traceback.format_exc()
+        for line in tb.rstrip().split('\n'):
+            if line.strip():
+                add_log("ERROR", f"  {line}")
+
+
+def add_error(msg, exc=None):
+    """
+    Log an ERROR with full stack trace when an exception is given.
+    Tracebacks are split across log entries (not truncated) so every frame
+    is visible in the dashboard and file logs.
+    """
+    add_log("ERROR", msg)
+    if exc is not None:
+        tb = traceback.format_exc()
+        for line in tb.rstrip().split('\n'):
+            if line.strip():
+                add_log("ERROR", f"  {line}")
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -539,6 +568,7 @@ async def bot_loop():
     executor = AutonomousExecutor(risk_mgr, clob, log_callback=add_log)
     price_feed = get_price_feed()
     market_cache = MarketCache(clob, ttl_seconds=2.0)
+    oracle_ws = get_oracle_ws()
 
     tier = risk_mgr.get_tier()
     add_log("TIER", f"STARTING TIER: {tier.emoji} {tier.name}")
@@ -574,23 +604,33 @@ async def bot_loop():
             add_log("ERROR", f"CLOB init failed: {e}")
 
     if wallet:
-        add_log("INIT", "Checking on-chain pUSD balance...")
+        add_log("INIT", "Checking on-chain pUSD balance (5 RPC fallbacks)...")
         onchain = clob.get_pusd_balance_onchain(wallet)
         if onchain is not None:
             STATE['onchain_balance'] = onchain
             add_log("INIT", f"On-chain pUSD: {onchain:.2f}")
             if Config.TRADING_MODE == 'live':
                 if onchain < Config.POLYMARKET_MIN_ORDER_SIZE:
-                    add_log("WARN", f"Balance too low: {onchain:.2f} < {Config.POLYMARKET_MIN_ORDER_SIZE:.2f}")
-                    add_log("WARN", "Deposit USDC on polymarket.com (auto-wraps to pUSD)")
-                else:
-                    risk_mgr.balance = onchain
-                    risk_mgr.starting_balance = onchain
-                    risk_mgr.peak_balance = onchain
-                    STATE['starting_balance'] = onchain
-                    add_log("INFO", f"Synced balance to on-chain: {onchain:.2f} pUSD")
+                    add_log("FATAL", f"Balance too low: {onchain:.2f} < {Config.POLYMARKET_MIN_ORDER_SIZE:.2f}")
+                    add_log("FATAL", "Deposit USDC on polymarket.com (auto-wraps to pUSD)")
+                    add_log("FATAL", "Bot stopping — cannot trade with insufficient balance.")
+                    return
+                risk_mgr.balance = onchain
+                risk_mgr.starting_balance = onchain
+                risk_mgr.peak_balance = onchain
+                STATE['starting_balance'] = onchain
+                add_log("INFO", f"Synced balance to on-chain: {onchain:.2f} pUSD")
         else:
-            add_log("WARN", "Could not read on-chain balance (RPC issue)")
+            # All RPCs failed — in live mode this is fatal
+            if Config.TRADING_MODE == 'live':
+                add_log("FATAL", "All 5 Polygon RPC endpoints failed.")
+                add_log("FATAL", "Cannot start live bot without confirmed on-chain balance.")
+                add_log("FATAL", "Check your internet/firewall, then restart.")
+                return
+            add_log("WARN", "Could not read on-chain balance (RPC issue) — paper mode continuing")
+    elif Config.TRADING_MODE == 'live':
+        add_log("FATAL", "Live mode but no wallet address derivable from POLY_PRIVATE_KEY")
+        return
 
     tg = TelegramUI(state_provider=lambda: STATE, executor=executor)
     if tg.available():
@@ -598,6 +638,10 @@ async def bot_loop():
         add_log("INIT", "Telegram bot started (/status /coins /positions /recent)")
     else:
         add_log("WARN", "Telegram disabled (TOKEN not set)")
+
+    # Start Binance oracle WebSocket (1s klines for front-running Polymarket)
+    asyncio.create_task(oracle_ws.start())
+    add_log("INIT", "Binance oracle WS starting in background (1s klines for BTC lead)")
 
     add_log("INIT", "")
     add_log("INIT", "BEAST MODE ACTIVE — scanning markets")
@@ -686,12 +730,13 @@ async def bot_loop():
                 'risk_mgr': risk_mgr,
                 'price_feed': price_feed,
                 'market_cache': market_cache,
+                'oracle_ws': oracle_ws,
             }
 
             try:
                 signals = await signal_ranker.get_ranked_signals(markets, context)
             except Exception as e:
-                add_log("ERROR", f"Signal generation: {e}")
+                add_error(f"Signal generation: {e}", e)
                 signals = []
 
             STATE['total_signals'] += len(signals)
@@ -724,12 +769,20 @@ async def bot_loop():
                                      f"{sig.confidence:.0%} {limit_str} | {sig.strategy}")
 
                 max_this_scan = min(len(signals), risk_mgr.current_tier.max_positions - risk_mgr.open_positions)
-                executed = 0
-                for sig in signals[:max_this_scan]:
-                    position = await executor.execute_signal(sig)
-                    if position:
-                        executed += 1
-                        STATE['total_trades'] += 1
+                # PARALLEL signal execution — fire every entry at the same
+                # moment instead of sequentially (old: blocked 300ms each)
+                if max_this_scan > 0:
+                    exec_tasks = [executor.execute_signal(sig) for sig in signals[:max_this_scan]]
+                    exec_results = await asyncio.gather(*exec_tasks, return_exceptions=True)
+                    executed = 0
+                    for i, result in enumerate(exec_results):
+                        if isinstance(result, Exception):
+                            add_error(f"Execute signal #{i+1}: {result}", result)
+                        elif result is not None:
+                            executed += 1
+                            STATE['total_trades'] += 1
+                else:
+                    executed = 0
 
                 if executed > 0:
                     add_log("SCAN", f"Executed {executed}/{max_this_scan} signals")
@@ -741,11 +794,13 @@ async def bot_loop():
             clob.send_heartbeat()
             STATE['scan_duration_ms'] = int((time.time() - scan_started) * 1000)
 
-            await asyncio.sleep(5)
+            # Fast scan cadence: 2s between scans. Oracle lead signals die
+            # in ~8s, so 5s was too slow. Gamma's discover_markets has its
+            # own caching so we don't hammer the API.
+            await asyncio.sleep(2)
 
         except Exception as e:
-            add_log("ERROR", f"Main loop: {e}")
-            add_log("ERROR", traceback.format_exc().replace('\n', ' | ')[:300])
+            add_error(f"Main loop: {e}", e)
             await asyncio.sleep(10)
 
 
