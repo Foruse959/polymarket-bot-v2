@@ -1,5 +1,1 @@
-"""Telegram bot for 5min_trade v2."""
-
-from .main import TelegramBot
-
-__all__ = ['TelegramBot']
+"""Telegram bot module for 5min_trade v2.2 Beast Mode."""
