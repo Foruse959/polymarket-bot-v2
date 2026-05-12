@@ -1,5 +1,6 @@
 # Secrets
-.env
+# .env is tracked (template values only — replace with real creds locally)
+!.env
 *.key
 *.pem
 
