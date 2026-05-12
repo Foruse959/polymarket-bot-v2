@@ -112,10 +112,8 @@ class ClobClient:
         return None
 
     def get_dual_orderbook(self, up_token: str, down_token: str) -> Optional[Dict]:
-        print(f"[CLOB] Fetching dual orderbook: UP={up_token[:20]}... DOWN={down_token[:20]}...", flush=True)
         up_book = self.get_orderbook(up_token)
         down_book = self.get_orderbook(down_token)
-        print(f"[CLOB] UP book: {type(up_book).__name__ if up_book else 'None'}, DOWN book: {type(down_book).__name__ if down_book else 'None'}", flush=True)
 
         if not up_book and not down_book:
             return None
@@ -549,3 +547,15 @@ class ClobClient:
             'reference_price': reference, 'target_price': target_price or reference,
             'edge_bps': edge_vs_mid, 'edge_pct': edge_vs_mid / 100,
         }
+
+    def send_heartbeat(self) -> bool:
+        """V2: Send heartbeat to keep orders alive. No-op if client not initialized."""
+        if not self._py_clob_client:
+            return False
+        try:
+            if hasattr(self._py_clob_client, 'heartbeat'):
+                self._py_clob_client.heartbeat()
+                return True
+        except Exception:
+            pass
+        return False
