@@ -582,9 +582,13 @@ async def bot_loop():
 
     wallet = Config.derive_wallet_address()
     funder = Config.get_funder_address()
-    STATE['wallet_address'] = wallet or ''
+    # Use proxy wallet for balance reads if set (holds pUSD on Polymarket)
+    balance_wallet = Config.POLY_PROXY_WALLET.strip() if Config.POLY_PROXY_WALLET else wallet
+    STATE['wallet_address'] = balance_wallet or wallet or ''
     if wallet:
-        add_log("INIT", f"Wallet: {wallet[:8]}...{wallet[-6:]}")
+        add_log("INIT", f"EOA Wallet: {wallet[:8]}...{wallet[-6:]}")
+    if balance_wallet and balance_wallet != wallet:
+        add_log("INIT", f"Proxy Wallet (pUSD): {balance_wallet[:8]}...{balance_wallet[-6:]}")
 
     if Config.TRADING_MODE == 'live':
         if not Config.is_live_ready():
@@ -603,34 +607,25 @@ async def bot_loop():
         except Exception as e:
             add_log("ERROR", f"CLOB init failed: {e}")
 
-    if wallet:
+    if balance_wallet:
         add_log("INIT", "Checking on-chain pUSD balance (5 RPC fallbacks)...")
-        onchain = clob.get_pusd_balance_onchain(wallet)
+        onchain = clob.get_pusd_balance_onchain(balance_wallet)
         if onchain is not None:
             STATE['onchain_balance'] = onchain
             add_log("INIT", f"On-chain pUSD: {onchain:.2f}")
             if Config.TRADING_MODE == 'live':
                 if onchain < Config.POLYMARKET_MIN_ORDER_SIZE:
-                    add_log("FATAL", f"Balance too low: {onchain:.2f} < {Config.POLYMARKET_MIN_ORDER_SIZE:.2f}")
-                    add_log("FATAL", "Deposit USDC on polymarket.com (auto-wraps to pUSD)")
-                    add_log("FATAL", "Bot stopping — cannot trade with insufficient balance.")
-                    return
-                risk_mgr.balance = onchain
-                risk_mgr.starting_balance = onchain
-                risk_mgr.peak_balance = onchain
-                STATE['starting_balance'] = onchain
-                add_log("INFO", f"Synced balance to on-chain: {onchain:.2f} pUSD")
+                    add_log("WARN", f"Balance low: {onchain:.2f} pUSD — will try trading anyway")
+                    add_log("WARN", "If orders fail, deposit USDC on polymarket.com")
+                else:
+                    risk_mgr.balance = onchain
+                    risk_mgr.starting_balance = onchain
+                    risk_mgr.peak_balance = onchain
+                    STATE['starting_balance'] = onchain
+                    add_log("INFO", f"Synced balance to on-chain: {onchain:.2f} pUSD")
         else:
-            # All RPCs failed — in live mode this is fatal
-            if Config.TRADING_MODE == 'live':
-                add_log("FATAL", "All 5 Polygon RPC endpoints failed.")
-                add_log("FATAL", "Cannot start live bot without confirmed on-chain balance.")
-                add_log("FATAL", "Check your internet/firewall, then restart.")
-                return
-            add_log("WARN", "Could not read on-chain balance (RPC issue) — paper mode continuing")
-    elif Config.TRADING_MODE == 'live':
-        add_log("FATAL", "Live mode but no wallet address derivable from POLY_PRIVATE_KEY")
-        return
+            add_log("WARN", "Could not read on-chain balance (RPC issue)")
+            add_log("WARN", "Bot continues — will check balance when order fails")
 
     tg = TelegramUI(state_provider=lambda: STATE, executor=executor)
     if tg.available():
@@ -662,8 +657,8 @@ async def bot_loop():
 
             add_log("SCAN", f"Round #{scan_round} | {risk_mgr.get_status_line()}")
 
-            if Config.TRADING_MODE == 'live' and wallet and (time.time() - last_balance_check > 60):
-                onchain = clob.get_pusd_balance_onchain(wallet)
+            if Config.TRADING_MODE == 'live' and balance_wallet and (time.time() - last_balance_check > 60):
+                onchain = clob.get_pusd_balance_onchain(balance_wallet)
                 if onchain is not None:
                     STATE['onchain_balance'] = onchain
                 last_balance_check = time.time()
