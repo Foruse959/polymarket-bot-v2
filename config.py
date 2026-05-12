@@ -1,29 +1,52 @@
 """
-5min_trade v2.1 — Configuration
+5min_trade v2.2 — Beast Mode Configuration
 
-Fully upgraded for Polymarket V2 (April 28, 2026):
-- pUSD collateral (NOT USDC.e) — backed 1:1 by USDC
-- pUSD Contract: 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB (Polygon)
-- CTF Exchange V2: 0xE111180000d2663C0091e4f400237545B87B996B
-- py-clob-client-v2 SDK with builder codes
-- Maker-focused strategies (zero maker fees, earn rebates)
-- Research-backed strategies from Becker's microstructure analysis
+Polymarket V2 with:
+- pUSD collateral
+- SOL/XRP + BTC/ETH support with runtime coin toggling
+- Persistent coin settings via coin_settings.json
+- Comprehensive logging at every decision point
+- Technical indicator-based strategies for 80%+ win rate
 """
 
 import os
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Persistent coin preferences file
+COIN_SETTINGS_FILE = os.path.join(os.path.dirname(__file__), 'coin_settings.json')
+
+
+def _load_coin_settings() -> dict:
+    """Load persistent coin settings from JSON (created by Telegram /coins command)."""
+    try:
+        if os.path.exists(COIN_SETTINGS_FILE):
+            with open(COIN_SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[Config] Warning: could not load coin_settings.json: {e}", flush=True)
+    return {}
+
+
+def _save_coin_settings(settings: dict) -> bool:
+    """Save coin settings to JSON."""
+    try:
+        with open(COIN_SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[Config] Error saving coin settings: {e}", flush=True)
+        return False
+
 
 class Config:
-    """Central configuration for the 5min_trade v2.1 bot."""
+    """Central configuration for 5min_trade v2.2 Beast Mode."""
 
     # ═══════════════════════════════════════════════════════════════════
-    # VERSION
-    # ═══════════════════════════════════════════════════════════════════
-    VERSION = "2.1.0"
-    VERSION_NAME = "Microstructure Edge"
+    VERSION = "2.2.0"
+    VERSION_NAME = "Beast Mode"
 
     # ═══════════════════════════════════════════════════════════════════
     # TELEGRAM
@@ -45,7 +68,7 @@ class Config:
     POLY_CHAIN_ID = int(os.getenv('POLY_CHAIN_ID', '137'))
 
     # ═══════════════════════════════════════════════════════════════════
-    # BUILDER RELAYER (V2: builder codes for attribution + gasless)
+    # BUILDER RELAYER
     # ═══════════════════════════════════════════════════════════════════
     POLY_BUILDER_API_KEY = os.getenv('POLY_BUILDER_API_KEY', '')
     POLY_BUILDER_SECRET = os.getenv('POLY_BUILDER_SECRET', '')
@@ -55,30 +78,24 @@ class Config:
     POLYGON_RPC_URL = os.getenv('POLYGON_RPC_URL', '')
 
     # ═══════════════════════════════════════════════════════════════════
-    # V2 CONTRACT ADDRESSES (April 28, 2026 upgrade)
+    # V2 CONTRACT ADDRESSES
     # ═══════════════════════════════════════════════════════════════════
     PUSD_CONTRACT = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB'
     CTF_EXCHANGE_V2 = '0xE111180000d2663C0091e4f400237545B87B996B'
     NEG_RISK_CTF_EXCHANGE = '0xe2222d279d744050d28e00520010520000310F59'
-    NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
-    CONDITIONAL_TOKENS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'
-    COLLATERAL_ONRAMP = '0x93070a847efEf7F70739046A929D47a521F5B8ee'
-    COLLATERAL_OFFRAMP = '0x2957922Eb93258b93368531d39fAcCA3B4dC5854'
-    CTF_COLLATERAL_ADAPTER = '0xAdA100Db00Ca00073811820692005400218FcE1f'
-    NEGRISK_COLLATERAL_ADAPTER = '0xadA2005600Dec949baf300f4C6120000bDB6eAab'
-    DEPOSIT_WALLET_FACTORY = '0x00000000000Fb5C9ADea0298D729A0CB3823Cc07'
 
     # ═══════════════════════════════════════════════════════════════════
-    # API ENDPOINTS (V2)
+    # API ENDPOINTS
     # ═══════════════════════════════════════════════════════════════════
     GAMMA_API_URL = 'https://gamma-api.polymarket.com'
     CLOB_API_URL = 'https://clob.polymarket.com'
+    BINANCE_API_URL = 'https://api.binance.com'
     BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws'
     POLYMARKET_WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market'
     POLYMARKET_LIVE_WS_URL = 'wss://ws-live-data.polymarket.com'
 
     # ═══════════════════════════════════════════════════════════════════
-    # PROXY / RELAY (bypass Polymarket geoblock)
+    # PROXY / RELAY
     # ═══════════════════════════════════════════════════════════════════
     PROXY_URL = os.getenv('PROXY_URL', '')
     CLOB_RELAY_URL = os.getenv('CLOB_RELAY_URL', '')
@@ -88,62 +105,76 @@ class Config:
     # TRADING MODE
     # ═══════════════════════════════════════════════════════════════════
     TRADING_MODE = os.getenv('TRADING_MODE', 'paper')
-    LIVE_RISK_MODE = os.getenv('LIVE_RISK_MODE', 'concentration')
     STARTING_BALANCE = float(os.getenv('STARTING_BALANCE', '100.0'))
-    POLYMARKET_MIN_ORDER_SIZE = 1.0  # $1 minimum (FOK minimum)
+    POLYMARKET_MIN_ORDER_SIZE = 1.0
     DEFAULT_ORDER_TYPE = os.getenv('DEFAULT_ORDER_TYPE', 'maker')
     MAKER_PREFERRED = os.getenv('MAKER_PREFERRED', 'true').lower() == 'true'
 
     # ═══════════════════════════════════════════════════════════════════
-    # V2 FEE STRUCTURE (fee = C * feeRate * p * (1-p))
-    # Makers NEVER pay fees. Only takers pay.
+    # V2 FEE STRUCTURE
     # ═══════════════════════════════════════════════════════════════════
     V2_FEE_RATES = {
-        'crypto': 0.07, 'sports': 0.03, 'finance': 0.04,
-        'politics': 0.04, 'economics': 0.05, 'culture': 0.05,
-        'weather': 0.05, 'tech': 0.04, 'mentions': 0.04,
-        'geopolitics': 0.0, 'other': 0.05,
+        'crypto': 0.07, 'sports': 0.03, 'finance': 0.04, 'politics': 0.04,
+        'economics': 0.05, 'culture': 0.05, 'weather': 0.05, 'tech': 0.04,
+        'mentions': 0.04, 'geopolitics': 0.0, 'other': 0.05,
     }
-    V2_MAKER_REBATES = {
-        'crypto': 0.20, 'sports': 0.25, 'finance': 0.25,
-        'politics': 0.25, 'economics': 0.25, 'culture': 0.25,
-        'weather': 0.25, 'tech': 0.25, 'mentions': 0.25,
-        'geopolitics': 0.0, 'other': 0.25,
-    }
+
     CATEGORY_SPREAD_MULTIPLIERS = {
-        'finance': 1.0, 'politics': 1.25, 'crypto': 1.5,
-        'sports': 1.75, 'entertainment': 2.0, 'culture': 2.0, 'other': 1.5,
+        'finance': 1.0, 'politics': 1.25, 'crypto': 1.5, 'sports': 1.75,
+        'entertainment': 2.0, 'culture': 2.0, 'other': 1.5,
     }
 
-    MARKET_FOCUS_IDLE_SCANS = int(os.getenv('MARKET_FOCUS_IDLE_SCANS', '3'))
-    MIN_EDGE_AFTER_FEES = float(os.getenv('MIN_EDGE_AFTER_FEES', '0.03'))
+    # ═══════════════════════════════════════════════════════════════════
+    # COINS — NOW SUPPORTS BTC, ETH, SOL, XRP (editable via Telegram)
+    # ═══════════════════════════════════════════════════════════════════
+    ALL_SUPPORTED_COINS = ['BTC', 'ETH', 'SOL', 'XRP']
 
-    # ═══════════════════════════════════════════════════════════════════
-    # COINS
-    # ═══════════════════════════════════════════════════════════════════
-    ENABLED_COINS = [c.strip().upper() for c in os.getenv('ENABLED_COINS', 'BTC,ETH').split(',')]
+    # Runtime coin settings (loaded from coin_settings.json or env)
+    _coin_settings = _load_coin_settings()
+
+    @classmethod
+    def _get_enabled_coins(cls) -> list:
+        """Get enabled coins from (1) coin_settings.json, (2) .env, (3) default."""
+        saved = cls._coin_settings.get('enabled_coins')
+        if saved and isinstance(saved, list):
+            return [c.upper() for c in saved if c.upper() in cls.ALL_SUPPORTED_COINS]
+        env_coins = os.getenv('ENABLED_COINS', 'BTC,ETH,SOL,XRP')
+        return [c.strip().upper() for c in env_coins.split(',') if c.strip().upper() in cls.ALL_SUPPORTED_COINS]
+
+    ENABLED_COINS = []  # Will be set below
+
     BINANCE_SYMBOLS = {'BTC': 'btcusdt', 'ETH': 'ethusdt', 'SOL': 'solusdt', 'XRP': 'xrpusdt'}
+    BINANCE_CANDLE_SYMBOLS = {'BTC': 'BTCUSDT', 'ETH': 'ETHUSDT', 'SOL': 'SOLUSDT', 'XRP': 'XRPUSDT'}
     COIN_PM = {'BTC': 'btc', 'ETH': 'eth', 'SOL': 'sol', 'XRP': 'xrp'}
-    SERIES_SLUGS = {5: '{coin}-up-or-down-5m', 15: '{coin}-up-or-down-15m', 30: '{coin}-up-or-down-30m'}
+    COIN_DISPLAY_NAMES = {'BTC': 'Bitcoin', 'ETH': 'Ethereum', 'SOL': 'Solana', 'XRP': 'XRP'}
+    SERIES_SLUGS = {
+        5: '{coin}-up-or-down-5m',
+        15: '{coin}-up-or-down-15m',
+        30: '{coin}-up-or-down-30m',
+    }
 
     # ═══════════════════════════════════════════════════════════════════
-    # TIMEFRAME SETTINGS
+    # TIMEFRAMES
     # ═══════════════════════════════════════════════════════════════════
     ENABLED_TIMEFRAMES = [int(t) for t in os.getenv('ENABLED_TIMEFRAMES', '5,15').split(',')]
+
     TIMEFRAME_PARAMS = {
-        5: {'name': '5 min', 'scan_interval': 1, 'position_size_pct': 3.0, 'max_positions': 20,
-            'take_profit_pct': 200.0, 'stop_loss_pct': 16.0, 'min_confidence': 0.40,
-            'preferred_strategies': ['microstructure_maker', 'volume_imbalance', 'momentum_breakout']},
-        15: {'name': '15 min', 'scan_interval': 3, 'position_size_pct': 3.0, 'max_positions': 20,
-             'take_profit_pct': 200.0, 'stop_loss_pct': 16.0, 'min_confidence': 0.40,
-             'preferred_strategies': ['microstructure_maker', 'mean_reversion', 'maker_edge']},
-        30: {'name': '30 min', 'scan_interval': 5, 'position_size_pct': 3.0, 'max_positions': 20,
-             'take_profit_pct': 200.0, 'stop_loss_pct': 16.0, 'min_confidence': 0.40,
-             'preferred_strategies': ['microstructure_maker', 'momentum_breakout', 'oracle_arb']},
+        5: {'name': '5 min', 'scan_interval': 1, 'position_size_pct': 3.0,
+            'max_positions': 20, 'take_profit_pct': 30.0, 'stop_loss_pct': 16.0,
+            'min_confidence': 0.55,
+            'preferred_strategies': ['indicator_fusion', 'microstructure_maker', 'momentum_breakout']},
+        15: {'name': '15 min', 'scan_interval': 3, 'position_size_pct': 3.0,
+             'max_positions': 20, 'take_profit_pct': 40.0, 'stop_loss_pct': 16.0,
+             'min_confidence': 0.55,
+             'preferred_strategies': ['indicator_fusion', 'microstructure_maker', 'mean_reversion']},
+        30: {'name': '30 min', 'scan_interval': 5, 'position_size_pct': 3.0,
+             'max_positions': 20, 'take_profit_pct': 50.0, 'stop_loss_pct': 16.0,
+             'min_confidence': 0.55,
+             'preferred_strategies': ['indicator_fusion', 'microstructure_maker', 'momentum_breakout']},
     }
 
     # ═══════════════════════════════════════════════════════════════════
-    # MAKER STRATEGY SETTINGS (Becker research + 186K market backtest)
+    # STRATEGY SETTINGS
     # ═══════════════════════════════════════════════════════════════════
     MAKER_MIN_SPREAD_BPS = float(os.getenv('MAKER_MIN_SPREAD_BPS', '50'))
     MAKER_TARGET_SPREAD_BPS = float(os.getenv('MAKER_TARGET_SPREAD_BPS', '100'))
@@ -156,7 +187,16 @@ class Config:
     LONGSHOT_MAX_POSITION = float(os.getenv('LONGSHOT_MAX_POSITION', '50.0'))
 
     # ═══════════════════════════════════════════════════════════════════
-    # RISK MANAGEMENT (Enhanced)
+    # BEAST MODE: HIGH-CONVICTION MODE
+    # When 3+ strategies agree → trade bigger, higher conviction
+    # ═══════════════════════════════════════════════════════════════════
+    HIGH_CONVICTION_MIN_STRATEGIES = 3
+    HIGH_CONVICTION_SIZE_MULTIPLIER = 1.5
+    STRICT_MIN_CONFIDENCE = float(os.getenv('STRICT_MIN_CONFIDENCE', '0.55'))
+    INDICATOR_WEIGHT = 1.2  # Indicator-based strategy gets extra weight
+
+    # ═══════════════════════════════════════════════════════════════════
+    # RISK MANAGEMENT
     # ═══════════════════════════════════════════════════════════════════
     MAX_DAILY_LOSS_PCT = float(os.getenv('MAX_DAILY_LOSS_PCT', '50.0'))
     MAX_TOTAL_POSITIONS = int(os.getenv('MAX_TOTAL_POSITIONS', '20'))
@@ -167,17 +207,14 @@ class Config:
     KELLY_MAX_BET_PCT = float(os.getenv('KELLY_MAX_BET_PCT', '0.08'))
 
     # ═══════════════════════════════════════════════════════════════════
-    # BACKWARD COMPATIBILITY
+    # BACKWARD COMPAT
     # ═══════════════════════════════════════════════════════════════════
-    STARTING_BALANCE_USDC = float(os.getenv('STARTING_BALANCE', '100.0'))
+    STARTING_BALANCE_USDC = STARTING_BALANCE
     POLYMARKET_MIN_ORDER_SIZE_USDC = 1.0
-    LONGSHOT_MAX_POSITION_USDC = float(os.getenv('LONGSHOT_MAX_POSITION', '50.0'))
+    LONGSHOT_MAX_POSITION_USDC = LONGSHOT_MAX_POSITION
     TAKER_FEE_RATE = float(os.getenv('TAKER_FEE_RATE', '0.03125'))
     MAKER_FEE_RATE = 0.0
 
-    # ═══════════════════════════════════════════════════════════════════
-    # DATABASE
-    # ═══════════════════════════════════════════════════════════════════
     DATABASE_PATH = os.getenv('DATABASE_PATH', 'data/trades.db')
 
     # ═══════════════════════════════════════════════════════════════════
@@ -237,17 +274,14 @@ class Config:
 
     @classmethod
     def format_balance(cls, amount: float) -> str:
-        """Format amount as pUSD string (V2 collateral token)."""
         return f"{amount:.2f} pUSD"
 
     @classmethod
     def format_usdc(cls, amount: float) -> str:
-        """Backward compat alias — shows pUSD."""
         return f"{amount:.2f} pUSD"
 
     @classmethod
     def get_taker_fee(cls, category: str, shares: float, price: float) -> float:
-        """Calculate V2 taker fee: fee = C * feeRate * p * (1-p)"""
         fee_rate = cls.V2_FEE_RATES.get(category.lower(), 0.05)
         return shares * fee_rate * price * (1 - price)
 
@@ -255,16 +289,58 @@ class Config:
     def get_category_spread_multiplier(cls, category: str) -> float:
         return cls.CATEGORY_SPREAD_MULTIPLIERS.get(category.lower(), 1.5)
 
+    # ─── COIN PREFERENCE MANAGEMENT ──────────────────────────────
+    @classmethod
+    def update_enabled_coins(cls, coins: list) -> bool:
+        """Toggle enabled coins at runtime (called by Telegram /coins command)."""
+        valid = [c.upper() for c in coins if c.upper() in cls.ALL_SUPPORTED_COINS]
+        if not valid:
+            return False
+        cls.ENABLED_COINS = valid
+        cls._coin_settings['enabled_coins'] = valid
+        return _save_coin_settings(cls._coin_settings)
+
+    @classmethod
+    def toggle_coin(cls, coin: str) -> bool:
+        """Toggle a single coin on/off. Returns True if now enabled."""
+        coin = coin.upper()
+        if coin not in cls.ALL_SUPPORTED_COINS:
+            return False
+        current = list(cls.ENABLED_COINS)
+        if coin in current:
+            current.remove(coin)
+            if not current:  # Don't allow zero coins
+                current = [coin]
+                cls.update_enabled_coins(current)
+                return True
+        else:
+            current.append(coin)
+        cls.update_enabled_coins(current)
+        return coin in cls.ENABLED_COINS
+
+    @classmethod
+    def reload_coin_settings(cls):
+        """Reload coin settings from disk."""
+        cls._coin_settings = _load_coin_settings()
+        cls.ENABLED_COINS = cls._get_enabled_coins()
+
     @classmethod
     def print_status(cls):
         mode = '📋 PAPER' if cls.is_paper() else '🔴 LIVE'
-        pk_ok = bool(cls.POLY_PRIVATE_KEY and cls.POLY_PRIVATE_KEY.strip())
         order_type = 'MAKER (0% fee)' if cls.MAKER_PREFERRED else 'TAKER'
         print(f"\n{'='*60}", flush=True)
         print(f"⚡ 5MIN_TRADE v{cls.VERSION} — {cls.VERSION_NAME}", flush=True)
         print(f"{'='*60}", flush=True)
-        print(f"Mode: {mode} | Orders: {order_type} | Collateral: pUSD (V2)", flush=True)
-        print(f"Coins: {', '.join(cls.ENABLED_COINS)} | TF: {cls.ENABLED_TIMEFRAMES}", flush=True)
+        print(f"Mode:    {mode}", flush=True)
+        print(f"Orders:  {order_type}", flush=True)
+        print(f"Coll:    pUSD (V2)", flush=True)
+        print(f"Coins:   {', '.join(cls.ENABLED_COINS)}", flush=True)
+        print(f"TFs:     {cls.ENABLED_TIMEFRAMES}min", flush=True)
         print(f"Balance: {cls.format_balance(cls.STARTING_BALANCE)}", flush=True)
-        print(f"Risk: Kelly={cls.KELLY_FRACTION} | Max DD={cls.DRAWDOWN_HALT_PCT}%", flush=True)
+        print(f"Risk:    Kelly={cls.KELLY_FRACTION} | Max DD={cls.DRAWDOWN_HALT_PCT}%", flush=True)
+        print(f"Conv:    Min conf={cls.STRICT_MIN_CONFIDENCE} | HC need {cls.HIGH_CONVICTION_MIN_STRATEGIES}+ agree", flush=True)
         print(f"{'='*60}\n", flush=True)
+
+
+# Initialize enabled coins AFTER class definition
+Config.ENABLED_COINS = Config._get_enabled_coins()
