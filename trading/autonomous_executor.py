@@ -22,6 +22,27 @@ from strategies.base_strategy import TradeSignal
 
 
 class Position:
+    """
+    Position with DYNAMIC TP/SL based on conviction level.
+    
+    Conviction-based exit system:
+      MAXIMUM (5+ strategies agree): TP=wait for resolution | SL=50%
+      HIGH (3-4 strategies):         TP=90% | SL=35%
+      MEDIUM (2 strategies):         TP=70% | SL=25%
+      SINGLE (1 strategy):           TP=35% | SL=16%
+    
+    The idea: when many signals agree, we're VERY confident → let it ride.
+    When only 1 signal fires, take profit quickly and cut losses tight.
+    """
+
+    # Dynamic TP/SL table based on conviction tier
+    DYNAMIC_EXITS = {
+        'MAXIMUM': {'tp_pct': 200.0, 'sl_pct': 50.0, 'hold_to_resolution': True},   # Let it resolve! Save fees
+        'HIGH':    {'tp_pct': 90.0,  'sl_pct': 35.0, 'hold_to_resolution': False},
+        'MEDIUM':  {'tp_pct': 70.0,  'sl_pct': 25.0, 'hold_to_resolution': False},
+        'SINGLE':  {'tp_pct': 35.0,  'sl_pct': 16.0, 'hold_to_resolution': False},
+    }
+
     def __init__(self, signal: TradeSignal, size_pusd: float, entry_price: float,
                  order_id: str = None):
         self.id = str(uuid.uuid4())[:8]
@@ -39,10 +60,28 @@ class Position:
         self.opened_at = time.time()
         self.shares = size_pusd / entry_price if entry_price > 0 else 0
 
-        tf_params = Config.get_timeframe_params(signal.timeframe)
-        self.take_profit_pct = tf_params['take_profit_pct']
-        self.stop_loss_pct = tf_params['stop_loss_pct']
-        self.max_hold_seconds = signal.timeframe * 60 + 60
+        # DYNAMIC TP/SL based on conviction tier
+        conviction_tier = signal.metadata.get('conviction_tier', 'SINGLE')
+        agreement_count = signal.metadata.get('agreement_count', 1)
+        exits = self.DYNAMIC_EXITS.get(conviction_tier, self.DYNAMIC_EXITS['SINGLE'])
+
+        self.take_profit_pct = exits['tp_pct']
+        self.stop_loss_pct = exits['sl_pct']
+        self.hold_to_resolution = exits['hold_to_resolution']
+        self.conviction_tier = conviction_tier
+        self.agreement_count = agreement_count
+
+        # Also scale by confidence — higher confidence = wider SL (more room)
+        if self.confidence >= 0.80:
+            self.stop_loss_pct *= 1.3  # 30% wider SL for high-confidence
+        elif self.confidence >= 0.70:
+            self.stop_loss_pct *= 1.15
+
+        # Market lifetime + buffer for resolution holding
+        if self.hold_to_resolution:
+            self.max_hold_seconds = signal.timeframe * 60 + 120  # Hold until resolution + 2min buffer
+        else:
+            self.max_hold_seconds = signal.timeframe * 60 + 60
 
         self.current_price = entry_price
         self.pnl_pusd = 0.0
@@ -61,14 +100,40 @@ class Position:
         self.pnl_pusd = self.size_pusd * self.pnl_pct / 100
 
     def should_exit(self) -> Optional[str]:
-        """Return exit reason or None."""
+        """
+        Dynamic exit logic based on conviction tier.
+        
+        MAXIMUM conviction: Hold to resolution (don't exit early unless massive loss)
+        HIGH: Wide TP/SL, give room to breathe
+        MEDIUM: Moderate TP/SL
+        SINGLE: Tight TP/SL, cut fast
+        """
         elapsed = time.time() - self.opened_at
+
+        # If holding to resolution (MAXIMUM conviction) — only exit on catastrophic loss
+        if self.hold_to_resolution:
+            if self.pnl_pct <= -self.stop_loss_pct:
+                return f'stop_loss_max ({self.pnl_pct:.1f}%, conviction={self.conviction_tier})'
+            if elapsed > self.max_hold_seconds:
+                return f'resolution_hold_complete ({elapsed:.0f}s)'
+            # Otherwise HOLD — let market resolve for maximum profit
+            return None
+
+        # Normal TP/SL for non-MAXIMUM tiers
         if self.pnl_pct >= self.take_profit_pct:
-            return f'profit_take ({self.pnl_pct:.1f}%)'
+            return f'profit_take ({self.pnl_pct:.1f}%, tp={self.take_profit_pct:.0f}%)'
         if self.pnl_pct <= -self.stop_loss_pct:
-            return f'stop_loss ({self.pnl_pct:.1f}%)'
+            return f'stop_loss ({self.pnl_pct:.1f}%, sl=-{self.stop_loss_pct:.0f}%)'
         if elapsed > self.max_hold_seconds:
             return f'timeout ({elapsed:.0f}s)'
+
+        # Trailing behavior: if we're in HIGH conviction and price is going our way,
+        # tighten the stop loss to protect gains
+        if self.conviction_tier == 'HIGH' and self.pnl_pct > 40:
+            # Move SL to breakeven + 10% once we're +40%
+            if self.pnl_pct < 10:  # Price reversed from +40 back to +10 — exit
+                return f'trailing_exit ({self.pnl_pct:.1f}%, was +40%+)'
+
         return None
 
     def to_dict(self) -> dict:
@@ -85,6 +150,9 @@ class Position:
             'pnl_pct': self.pnl_pct,
             'tp_pct': self.take_profit_pct,
             'sl_pct': -self.stop_loss_pct,
+            'conviction_tier': self.conviction_tier,
+            'agreement_count': self.agreement_count,
+            'hold_to_resolution': self.hold_to_resolution,
             'elapsed_sec': int(time.time() - self.opened_at),
             'status': self.status,
         }
@@ -189,7 +257,9 @@ class AutonomousExecutor:
         self.risk_mgr.register_position(signal.market_id, size_pusd)
 
         self.log('TRADE', f"   ✅ Position opened: {position.id} "
-                         f"TP=+{position.take_profit_pct:.0f}% SL=-{position.stop_loss_pct:.0f}%")
+                         f"TP=+{position.take_profit_pct:.0f}% SL=-{position.stop_loss_pct:.0f}% "
+                         f"[{position.conviction_tier}] "
+                         f"{'🔒HOLD TO RESOLUTION' if position.hold_to_resolution else ''}")
         return position
 
     async def monitor_positions(self, current_prices: Dict[str, float]) -> List[Position]:
