@@ -23,25 +23,52 @@ from strategies.base_strategy import TradeSignal
 
 class Position:
     """
-    Position with DYNAMIC TP/SL based on conviction level.
+    Position with LINEAR SCORE-BASED TP/SL.
     
-    Conviction-based exit system:
-      MAXIMUM (5+ strategies agree): TP=wait for resolution | SL=50%
-      HIGH (3-4 strategies):         TP=90% | SL=35%
-      MEDIUM (2 strategies):         TP=70% | SL=25%
-      SINGLE (1 strategy):           TP=35% | SL=16%
+    New formula (v2 beast mode upgrade):
+      TP% = 30 + (score - 1) * 15
+      SL% = 16 + (score - 1) * 5
+      score >= 5 → hold to resolution (let market close naturally)
     
-    The idea: when many signals agree, we're VERY confident → let it ride.
-    When only 1 signal fires, take profit quickly and cut losses tight.
+    Score is the agreement_count (number of strategies that agree).
+    
+    Examples:
+      score=1 → TP=30%, SL=16%     (conservative, single signal)
+      score=2 → TP=45%, SL=21%     (MEDIUM)
+      score=3 → TP=60%, SL=26%     (HIGH)
+      score=4 → TP=75%, SL=31%     (stronger HIGH)
+      score=5+ → hold to resolution (MAXIMUM, let it resolve)
+    
+    The idea: more strategies agreeing = wider targets + more patience.
+    Linear scaling replaces the old stepped tier table for smoother behavior.
     """
 
-    # Dynamic TP/SL table based on conviction tier
+    # Legacy tier table (kept for backward compat / fallback only)
     DYNAMIC_EXITS = {
-        'MAXIMUM': {'tp_pct': 200.0, 'sl_pct': 50.0, 'hold_to_resolution': True},   # Let it resolve! Save fees
+        'MAXIMUM': {'tp_pct': 200.0, 'sl_pct': 50.0, 'hold_to_resolution': True},
         'HIGH':    {'tp_pct': 90.0,  'sl_pct': 35.0, 'hold_to_resolution': False},
         'MEDIUM':  {'tp_pct': 70.0,  'sl_pct': 25.0, 'hold_to_resolution': False},
         'SINGLE':  {'tp_pct': 35.0,  'sl_pct': 16.0, 'hold_to_resolution': False},
     }
+
+    @staticmethod
+    def compute_exits_from_score(score: int) -> dict:
+        """
+        Linear score-based TP/SL formula.
+        
+        Args:
+            score: agreement_count (number of strategies that agreed on this direction)
+        
+        Returns:
+            dict with tp_pct, sl_pct, hold_to_resolution
+        """
+        score = max(1, int(score))
+        if score >= 5:
+            # Hold to resolution — maximum conviction, let market close
+            return {'tp_pct': 200.0, 'sl_pct': 50.0, 'hold_to_resolution': True}
+        tp_pct = 30.0 + (score - 1) * 15.0  # 30, 45, 60, 75
+        sl_pct = 16.0 + (score - 1) * 5.0   # 16, 21, 26, 31
+        return {'tp_pct': tp_pct, 'sl_pct': sl_pct, 'hold_to_resolution': False}
 
     def __init__(self, signal: TradeSignal, size_pusd: float, entry_price: float,
                  order_id: str = None):
@@ -60,10 +87,10 @@ class Position:
         self.opened_at = time.time()
         self.shares = size_pusd / entry_price if entry_price > 0 else 0
 
-        # DYNAMIC TP/SL based on conviction tier
+        # LINEAR SCORE-BASED TP/SL (v2 beast mode upgrade)
         conviction_tier = signal.metadata.get('conviction_tier', 'SINGLE')
         agreement_count = signal.metadata.get('agreement_count', 1)
-        exits = self.DYNAMIC_EXITS.get(conviction_tier, self.DYNAMIC_EXITS['SINGLE'])
+        exits = self.compute_exits_from_score(agreement_count)
 
         self.take_profit_pct = exits['tp_pct']
         self.stop_loss_pct = exits['sl_pct']
@@ -207,6 +234,27 @@ class AutonomousExecutor:
         if size_pusd < Config.POLYMARKET_MIN_ORDER_SIZE:
             self.log('WARN', f"⚠️ Size {size_pusd:.2f} < min {Config.POLYMARKET_MIN_ORDER_SIZE} — skip")
             return None
+
+        # LIQUIDITY DEPTH CHECK (beast mode upgrade)
+        # Skip if orderbook depth < 5x our position size to avoid
+        # excessive slippage on entry. Applies to both paper & live.
+        if signal.token_id and hasattr(self.clob, 'get_orderbook'):
+            try:
+                book = self.clob.get_orderbook(signal.token_id)
+                if book and not book.get('_synthetic'):
+                    side = 'BUY'
+                    if signal.direction in ('SELL_UP', 'SHORT'):
+                        side = 'SELL'
+                    # BUY consumes ask depth, SELL consumes bid depth
+                    depth = book.get('ask_depth', 0) if side == 'BUY' else book.get('bid_depth', 0)
+                    required = size_pusd * 5
+                    if depth < required:
+                        self.log('LIQUIDITY',
+                                 f"⚠️ Thin book: {signal.coin} {signal.direction} "
+                                 f"depth=${depth:.2f} < 5x size=${required:.2f} — skip")
+                        return None
+            except Exception as e:
+                self.log('DEBUG', f"Liquidity check skipped: {e}")
 
         entry_price = signal.limit_price or signal.entry_price
 
