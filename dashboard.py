@@ -39,6 +39,7 @@ from data.oracle_ws import get_oracle_ws
 from trading.v2_risk_manager import V2RiskManager
 from trading.signal_ranker import SignalRanker
 from trading.autonomous_executor import AutonomousExecutor
+from trading.auto_redeem import AutoRedeemer
 from bot.telegram_ui import TelegramUI
 
 
@@ -59,6 +60,7 @@ STATE = {
     'last_signals': [],
     'total_trades': 0,
     'open_positions': [],
+    'pending_orders': [],
     'closed_trades': [],
     'balance': Config.STARTING_BALANCE,
     'starting_balance': Config.STARTING_BALANCE,
@@ -68,6 +70,7 @@ STATE = {
     'risk': {},
     'tier': {},
     'strategy_stats': {},
+    'redeem_stats': {},
     'logs': [],
     'errors': [],
     'last_scan_at': None,
@@ -565,7 +568,31 @@ async def bot_loop():
     clob = ClobClient()
     risk_mgr = V2RiskManager(Config.STARTING_BALANCE, log_callback=add_log)
     signal_ranker = SignalRanker(log_callback=add_log)
-    executor = AutonomousExecutor(risk_mgr, clob, log_callback=add_log)
+
+    # Balance refresh callback — invoked by executor after every fill/exit
+    # and by the auto-redeem loop after every redemption. Re-reads on-chain
+    # pUSD balance for whichever wallet holds collateral (proxy > EOA).
+    def _refresh_balance():
+        try:
+            wallet_for_balance = (
+                Config.POLY_PROXY_WALLET.strip()
+                if Config.POLY_PROXY_WALLET
+                else Config.derive_wallet_address()
+            )
+            if not wallet_for_balance:
+                return None
+            bal = clob.get_pusd_balance_onchain(wallet_for_balance)
+            if bal is not None:
+                STATE['onchain_balance'] = bal
+            return bal
+        except Exception:
+            return None
+
+    executor = AutonomousExecutor(
+        risk_mgr, clob,
+        log_callback=add_log,
+        balance_refresh_cb=_refresh_balance,
+    )
     price_feed = get_price_feed()
     market_cache = MarketCache(clob, ttl_seconds=2.0)
     oracle_ws = get_oracle_ws()
@@ -627,6 +654,26 @@ async def bot_loop():
             add_log("WARN", "Could not read on-chain balance (RPC issue)")
             add_log("WARN", "Bot continues — will check balance when order fails")
 
+    # ── Auto-Redeemer: watches for resolved positions and redeems to pUSD ──
+    # Only meaningful in live mode; in paper mode we have no on-chain positions.
+    redeemer = None
+    if Config.TRADING_MODE == 'live':
+        try:
+            redeemer = AutoRedeemer(clob, sig_type=Config.POLY_SIGNATURE_TYPE)
+            if redeemer.init():
+                add_log("INIT",
+                        f"Auto-redeem enabled (method={redeemer._method}, "
+                        f"interval={Config.AUTO_REDEEM_INTERVAL}s)")
+            else:
+                errs = '; '.join(redeemer._init_errors[-2:]) if redeemer._init_errors else 'no method'
+                add_log("WARN", f"Auto-redeem disabled: {errs}")
+                redeemer = None
+        except Exception as e:
+            add_log("ERROR", f"AutoRedeemer init failed: {e}")
+            redeemer = None
+    else:
+        add_log("INFO", "Auto-redeem skipped (paper mode)")
+
     tg = TelegramUI(state_provider=lambda: STATE, executor=executor)
     if tg.available():
         tg.run_in_thread()
@@ -668,6 +715,22 @@ async def bot_loop():
                 await asyncio.sleep(15)
                 continue
 
+            # ── Auto-redeem resolved positions (no-op between 2-min cooldown) ──
+            if redeemer is not None:
+                try:
+                    redeem_result = await redeemer.check_and_redeem()
+                    if redeem_result.get('redeemed', 0) > 0:
+                        recovered = redeem_result.get('total_redeemed_usd', 0) or 0
+                        add_log("INFO",
+                                f"💰 Auto-redeemed {redeem_result['redeemed']} "
+                                f"position(s) → +${recovered:.2f}")
+                        # Redemption credits pUSD back to proxy wallet.
+                        # Refresh balance so dashboard + risk manager see it.
+                        _refresh_balance()
+                    STATE['redeem_stats'] = redeemer.get_status()
+                except Exception as e:
+                    add_log("DEBUG", f"Auto-redeem cycle error (non-fatal): {e}")
+
             can_trade, reason = risk_mgr.can_trade()
             STATE['risk'] = risk_mgr.get_stats()
             STATE['tier'] = {
@@ -708,6 +771,18 @@ async def bot_loop():
             tf_count = len(set(m['timeframe'] for m in markets))
             add_log("SCAN", f"Found {len(markets)} markets ({coins_count} coins x {tf_count} TFs)")
 
+            # ── Pending-order polling: check if GTC limits have filled ──
+            # This MUST run before monitor_positions so newly-filled orders
+            # become positions visible to TP/SL logic on the same scan.
+            if executor.pending_orders:
+                try:
+                    resolved = await executor.monitor_pending_orders()
+                    if resolved:
+                        add_log("INFO",
+                                f"Resolved {resolved} pending order(s) this scan")
+                except Exception as e:
+                    add_error(f"Pending-order monitor: {e}", e)
+
             if executor.open_positions:
                 pos_tokens = [p.token_id for p in executor.open_positions.values()]
                 current_prices = await market_cache.get_mid_prices(pos_tokens)
@@ -719,6 +794,7 @@ async def bot_loop():
 
             STATE['open_positions'] = executor.get_positions_snapshot()
             STATE['closed_trades'] = executor.get_closed_snapshot(15)
+            STATE['pending_orders'] = executor.get_pending_snapshot()
 
             context = {
                 'clob': clob,

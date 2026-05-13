@@ -564,6 +564,127 @@ class ClobClient:
             pass
         return False
 
+    # ───────────────────────────────────────────────────────────────
+    # ORDER STATUS TRACKING
+    # ───────────────────────────────────────────────────────────────
+
+    def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """
+        Fetch full order record from CLOB.
+        Returns dict with at least: status, size_matched (str), size (str).
+
+        Status values observed from V2:
+          LIVE       — open, unmatched
+          MATCHED    — fully filled
+          CANCELED   — canceled by user or system
+          DELAYED    — processing
+          UNMATCHED  — never filled (FOK failed)
+          REJECTED   — rejected by validation
+
+        Returns None on failure (e.g. network).
+        """
+        if not self._py_clob_client or not order_id:
+            return None
+        try:
+            order = self._py_clob_client.get_order(order_id)
+            # SDK returns a dict; normalize keys we rely on
+            if not isinstance(order, dict):
+                try:
+                    order = dict(order)
+                except Exception:
+                    return None
+            # Normalize status
+            status = (order.get('status') or order.get('state') or 'UNKNOWN')
+            order['status'] = str(status).upper()
+            return order
+        except Exception as e:
+            msg = str(e).lower()
+            # 404 / not-found often means order was instantly matched and
+            # pruned from the open-order store — treat as possibly-filled
+            if 'not found' in msg or '404' in msg:
+                return {'status': 'NOT_FOUND', '_gone': True}
+            return None
+
+    def is_order_filled(self, order_id: str) -> Tuple[Optional[bool], Optional[Dict]]:
+        """
+        Returns (filled_bool, raw_order).
+          filled_bool = True  if fully or partially matched
+          filled_bool = False if still LIVE/DELAYED (pending)
+          filled_bool = None  if terminal non-fill (CANCELED / UNMATCHED /
+                              REJECTED / NOT_FOUND) — caller should drop it
+        """
+        raw = self.get_order_status(order_id)
+        if raw is None:
+            return False, None  # network hiccup — treat as still pending
+
+        status = raw.get('status', 'UNKNOWN')
+
+        try:
+            size_matched = float(raw.get('size_matched', 0) or 0)
+        except (ValueError, TypeError):
+            size_matched = 0.0
+
+        if size_matched > 0 or status == 'MATCHED':
+            return True, raw
+
+        if status in ('CANCELED', 'CANCELLED', 'UNMATCHED', 'REJECTED',
+                      'EXPIRED', 'NOT_FOUND'):
+            return None, raw
+
+        # LIVE / DELAYED / UNKNOWN — still pending
+        return False, raw
+
+    def get_trades_for_order(self, order_id: str) -> List[Dict]:
+        """Return fills list for a given order_id (used to compute avg price)."""
+        if not self._py_clob_client:
+            return []
+        try:
+            from py_clob_client_v2.clob_types import TradeParams
+            trades = self._py_clob_client.get_trades(
+                TradeParams(id=order_id), only_first_page=True
+            ) or []
+            return list(trades)
+        except Exception:
+            return []
+
+    def get_fill_price(self, order_id: str, fallback: float = 0.0) -> float:
+        """Average fill price for this order, or fallback."""
+        trades = self.get_trades_for_order(order_id)
+        if not trades:
+            return fallback
+        total_sz = 0.0
+        total_px = 0.0
+        for t in trades:
+            try:
+                sz = float(t.get('size', 0) or 0)
+                px = float(t.get('price', 0) or 0)
+                if sz > 0 and px > 0:
+                    total_sz += sz
+                    total_px += sz * px
+            except Exception:
+                continue
+        return (total_px / total_sz) if total_sz > 0 else fallback
+
+    def place_fok_order(self, token_id: str, side: str, price: float,
+                        size_pusd: float, neg_risk: bool = False) -> Optional[Dict]:
+        """
+        Place a fill-or-kill limit order.
+        Used for high-conviction entries where we need immediate execution
+        at a specific price (taker-style) — either fully fills or cancels.
+        """
+        if not self._py_clob_client:
+            print("[CLOB] ❌ Client not initialized — cannot place FOK order", flush=True)
+            return None
+        size_pusd = max(size_pusd, Config.POLYMARKET_MIN_ORDER_SIZE)
+        try:
+            if self._is_v2:
+                return self._place_order_v2(token_id, side, size_pusd, price, 'FOK', neg_risk)
+            else:
+                return self._place_order_v1(token_id, side, size_pusd, price, 'FOK')
+        except Exception as e:
+            print(f"[CLOB] ❌ FOK order failed: {e}", flush=True)
+            return None
+
     def is_initialized(self) -> bool:
         return self._py_clob_client is not None
 
