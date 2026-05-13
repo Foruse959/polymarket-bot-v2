@@ -38,6 +38,9 @@ class TelegramUI:
     def __init__(self, state_provider: Callable = None, executor=None):
         self.state_provider = state_provider or (lambda: {})
         self.executor = executor
+        # risk_mgr is pulled from executor when available so /tier can work.
+        # Callers may also pass risk_mgr directly for read-only contexts.
+        self.risk_mgr = getattr(executor, 'risk_mgr', None)
         self.app = None
         self._paused = False
 
@@ -59,8 +62,9 @@ class TelegramUI:
             f"<b>Coins:</b> {', '.join(Config.ENABLED_COINS)}\n"
             f"<b>Timeframes:</b> {Config.ENABLED_TIMEFRAMES} min\n\n"
             "Commands:\n"
-            "  /status — balance & PnL\n"
+            "  /status — balance &amp; PnL\n"
             "  /coins — select BTC/ETH/SOL/XRP\n"
+            "  /tier — change trading tier (SURVIVAL/SEED/etc)\n"
             "  /positions — open trades\n"
             "  /recent — last 10 trades\n"
             "  /pause /resume — control bot\n"
@@ -73,8 +77,18 @@ class TelegramUI:
         start_bal = state.get('starting_balance', 100.0)
         ret_pct = ((balance - start_bal) / start_bal * 100) if start_bal > 0 else 0
 
+        tier_emoji = risk.get('tier_emoji', '')
+        tier_name = risk.get('tier', '—')
+        manual = risk.get('manual_tier')
+        tier_line = f"{tier_emoji} {tier_name}"
+        if manual:
+            tier_line += " 🔒 (manual lock)"
+        else:
+            tier_line += " (auto)"
+
         text = (
             f"💰 <b>Balance:</b> {balance:.2f} pUSD\n"
+            f"🎚️ <b>Tier:</b> {tier_line}\n"
             f"📊 <b>Return:</b> {ret_pct:+.1f}%\n"
             f"📈 <b>Total PnL:</b> {state.get('total_pnl', 0):+.2f} pUSD\n"
             f"📅 <b>Daily PnL:</b> {state.get('daily_pnl', 0):+.2f} pUSD\n\n"
@@ -151,6 +165,105 @@ class TelegramUI:
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await self.cmd_start(update, ctx)
 
+    async def cmd_tier(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Show tier picker. Lets user override balance-based tier selection."""
+        if not self.risk_mgr:
+            await update.message.reply_text("Risk manager not available.")
+            return
+        rm = self.risk_mgr
+        current = rm.current_tier
+        manual = rm.get_manual_tier()
+        lock_line = (
+            f"🔒 <b>Locked to {manual}</b> (overriding balance)"
+            if manual else f"🤖 Auto (picked by balance)"
+        )
+        buttons = self._build_tier_buttons()
+        await update.message.reply_html(
+            f"<b>🎚️ Select trading tier:</b>\n"
+            f"Balance: {rm.balance:.2f} pUSD\n"
+            f"Current: {current.emoji} {current.name}\n"
+            f"Mode: {lock_line}\n\n"
+            f"<i>Pick a tier to lock it regardless of balance, or AUTO to let the bot decide.</i>",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def tier_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle tier button press."""
+        query = update.callback_query
+        await query.answer()
+        if not self.risk_mgr:
+            await query.edit_message_text("Risk manager not available.")
+            return
+        data = query.data
+        if not data.startswith('tier:'):
+            return
+        name = data.split(':', 1)[1]
+        ok, msg = self.risk_mgr.set_manual_tier(name)
+        tier = self.risk_mgr.current_tier
+        manual = self.risk_mgr.get_manual_tier()
+        lock_line = (
+            f"🔒 <b>Locked to {manual}</b> (overriding balance)"
+            if manual else f"🤖 Auto (picked by balance)"
+        )
+        buttons = self._build_tier_buttons()
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"<b>🎚️ Select trading tier:</b>\n"
+                    f"Balance: {self.risk_mgr.balance:.2f} pUSD\n"
+                    f"Current: {tier.emoji} {tier.name}\n"
+                    f"Mode: {lock_line}\n\n"
+                    f"{'✅' if ok else '❌'} {msg}\n\n"
+                    f"<i>Tap another tier to change, or AUTO for balance-based.</i>"
+                ),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception:
+            # Ignore "message is not modified" if user taps same button
+            pass
+
+    def _build_tier_buttons(self):
+        """Tier picker keyboard. 2 columns, tier + AUTO."""
+        current_name = self.risk_mgr.current_tier.name if self.risk_mgr else ''
+        manual = self.risk_mgr.get_manual_tier() if self.risk_mgr else None
+
+        tier_defs = [
+            ('SURVIVAL', '🛡️'),
+            ('SEED', '🌱'),
+            ('COMFORT', '⚖️'),
+            ('AGGRESSIVE', '🔥'),
+            ('FULL SEND', '🚀'),
+        ]
+        rows = []
+        row = []
+        for name, emoji in tier_defs:
+            # Lock icon shows which tier is manually locked
+            is_locked = manual == name
+            is_active = current_name == name
+            if is_locked:
+                mark = '🔒'
+            elif is_active:
+                mark = '●'
+            else:
+                mark = '○'
+            row.append(InlineKeyboardButton(
+                f"{mark} {emoji} {name}",
+                callback_data=f"tier:{name}",
+            ))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        # AUTO button on its own row
+        auto_mark = '●' if manual is None else '○'
+        rows.append([InlineKeyboardButton(
+            f"{auto_mark} 🤖 AUTO (by balance)",
+            callback_data="tier:AUTO",
+        )])
+        return rows
+
     async def coin_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Handle coin toggle button press."""
         query = update.callback_query
@@ -213,11 +326,13 @@ class TelegramUI:
         self.app.add_handler(CommandHandler("help", self.cmd_help))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("coins", self.cmd_coins))
+        self.app.add_handler(CommandHandler("tier", self.cmd_tier))
         self.app.add_handler(CommandHandler("positions", self.cmd_positions))
         self.app.add_handler(CommandHandler("recent", self.cmd_recent))
         self.app.add_handler(CommandHandler("pause", self.cmd_pause))
         self.app.add_handler(CommandHandler("resume", self.cmd_resume))
         self.app.add_handler(CallbackQueryHandler(self.coin_callback, pattern=r'^coin:'))
+        self.app.add_handler(CallbackQueryHandler(self.tier_callback, pattern=r'^tier:'))
 
         try:
             loop.run_until_complete(self.app.run_polling(close_loop=False, stop_signals=None))
