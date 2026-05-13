@@ -141,19 +141,58 @@ class V2RiskManager:
         self._halted = False
         self._halt_reason = ''
         self._halt_until = 0
+        # Manual tier override — user can lock the bot to any tier regardless
+        # of balance via Telegram /tier command. None = auto-pick by balance.
+        self._manual_tier_override: Optional[str] = None
         self.log = log_callback or (lambda lvl, msg: None)
         self.current_tier = self._determine_tier()
         self._last_tier_name = self.current_tier.name
 
+    # ─── Manual tier override ───────────────────────────────────
+    def set_manual_tier(self, tier_name: Optional[str]) -> Tuple[bool, str]:
+        """
+        Lock the bot to a specific tier regardless of balance. Pass None or
+        'AUTO' to restore automatic balance-based selection.
+        Returns (ok, message).
+        """
+        if tier_name is None or tier_name.upper() in ('AUTO', 'NONE', 'OFF'):
+            self._manual_tier_override = None
+            self.current_tier = self._determine_tier()
+            self._last_tier_name = self.current_tier.name
+            return True, f"Tier set to AUTO ({self.current_tier.emoji} {self.current_tier.name})"
+
+        name = tier_name.upper().strip()
+        # Accept 'FULL' as shorthand for 'FULL SEND'
+        if name == 'FULL':
+            name = 'FULL SEND'
+        for t in TIERS:
+            if t.name == name:
+                self._manual_tier_override = t.name
+                self.current_tier = t
+                self._last_tier_name = t.name
+                self.log('TIER', f"🔒 MANUAL TIER LOCK: {t.emoji} {t.name} (balance={self.balance:.2f})")
+                return True, f"Tier locked to {t.emoji} {t.name} (overrides balance-based selection)"
+        return False, f"Unknown tier '{tier_name}'. Valid: SURVIVAL, SEED, COMFORT, AGGRESSIVE, FULL SEND, AUTO"
+
+    def get_manual_tier(self) -> Optional[str]:
+        return self._manual_tier_override
+
     def _determine_tier(self) -> BalanceTier:
-        """Find current tier based on balance."""
+        """Find current tier. Manual override beats balance-based selection."""
+        if self._manual_tier_override:
+            for tier in TIERS:
+                if tier.name == self._manual_tier_override:
+                    return tier
         for tier in TIERS:
             if tier.contains(self.balance):
                 return tier
         return TIERS[0]
 
     def _check_tier_change(self):
-        """Log tier transitions."""
+        """Log tier transitions. Manual override disables auto-transitions."""
+        if self._manual_tier_override:
+            # User has locked a tier; keep it no matter what balance does.
+            return
         new_tier = self._determine_tier()
         if new_tier.name != self._last_tier_name:
             direction = "⬆️ UP" if new_tier.min_bal > self.current_tier.min_bal else "⬇️ DOWN"
@@ -239,11 +278,17 @@ class V2RiskManager:
         - Drawdown scaling
         - Streak multipliers
         - High conviction multiplier
+        
+        Floor: always enforces POLYMARKET_MIN_ORDER_SIZE. If even the MIN
+        order would exceed available tradeable balance, returns 0 (skip).
+        This fixes the sub-minimum sizing bug where $6 balance + SEED tier
+        → base size 0.25 → max(MIN=1, 0.25)=1 → min(cap=0.90) = 0.90 REJECTED.
         """
         if not self.can_trade()[0]:
             return 0.0
 
         tier = self.current_tier
+        MIN = Config.POLYMARKET_MIN_ORDER_SIZE
 
         # Edge calculation
         edge = confidence - 0.50
@@ -256,7 +301,6 @@ class V2RiskManager:
         kelly_capped = min(kelly_safe, Config.KELLY_MAX_BET_PCT)
 
         # Tier-based sizing
-        # Scale between bet_pct_min and bet_pct_max based on confidence
         conf_progress = (confidence - tier.min_confidence) / (0.95 - tier.min_confidence)
         conf_progress = max(0, min(1, conf_progress))
         tier_pct = tier.bet_pct_min + (tier.bet_pct_max - tier.bet_pct_min) * conf_progress
@@ -264,7 +308,13 @@ class V2RiskManager:
         # Use the smaller of Kelly vs tier max (safety)
         effective_pct = min(kelly_capped * 100, tier_pct)
 
-        tradeable = max(Config.POLYMARKET_MIN_ORDER_SIZE, self.balance - tier.reserve)
+        # Cap reserve at 50% of balance. Without this, manually overriding to
+        # AGGRESSIVE (reserve=$10) with a $3 balance gives tradeable=-$7 which
+        # we clamp to $1, and the bot can never place an order. Capping at
+        # balance/2 means low-balance users can still use high tiers — they
+        # just get half their balance as playing money and half as reserve.
+        effective_reserve = min(tier.reserve, self.balance * 0.5)
+        tradeable = max(MIN, self.balance - effective_reserve)
         size = tradeable * effective_pct / 100.0
 
         # Drawdown scaling
@@ -294,13 +344,30 @@ class V2RiskManager:
         elif conviction_tier == 'MEDIUM':
             size *= 1.1
 
-        # Absolute limits
-        size = max(Config.POLYMARKET_MIN_ORDER_SIZE, size)
-        # Survival tier has absolute max of $1.50 per trade
+        # ── Apply CAPS first (shrink size if too big) ──
         if tier.name == 'SURVIVAL':
+            # SURVIVAL: absolute cap of 1.5 pUSD per trade
             size = min(size, 1.5)
         else:
+            # Other tiers: cap to 25% of tradeable and 15% of balance
             size = min(size, tradeable * 0.25, self.balance * 0.15)
+
+        # ── Hard floor: enforce exchange minimum AFTER all caps ──
+        # Low-balance tiers always need a MIN-sized order or we can never
+        # trade. Only skip if we can't even afford the MIN out of tradeable.
+        if size < MIN:
+            # Can we afford a MIN-sized order without blowing past balance?
+            # Need MIN + a tiny buffer so we don't end up negative on gas/rounding
+            required_buffer = MIN * 1.05
+            if tradeable >= required_buffer:
+                # Bump size UP to MIN. User's tier config said "bet X%" but the
+                # exchange won't let us bet less than MIN, so MIN is the true
+                # minimum bet size.
+                size = MIN
+            else:
+                # Can't afford even a MIN order. Skip rather than return an
+                # invalid size below MIN.
+                return 0.0
 
         return round(size, 2)
 
@@ -382,4 +449,5 @@ class V2RiskManager:
             'tier_max_positions': self.current_tier.max_positions,
             'halted': self._halted,
             'halt_reason': self._halt_reason,
+            'manual_tier': self._manual_tier_override,
         }
