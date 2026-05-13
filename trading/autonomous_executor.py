@@ -65,13 +65,65 @@ class Position:
     }
 
     @staticmethod
-    def compute_exits_from_score(score: int) -> dict:
+    def compute_exits_from_score(score: int, timeframe: int = 5) -> dict:
+        """
+        Linear score-based TP/SL, scaled by timeframe.
+
+        Score determines base TP/SL (more strategies agreeing = wider targets).
+        Timeframe multiplier widens targets for longer markets — a 30min market
+        has ~2.4x the price variance of a 5min market (sqrt(30/5) ≈ 2.45), so
+        a SL tight enough for 5min trades fires prematurely on 30min trades
+        before the thesis has time to play out.
+
+        TIMEFRAME MULTIPLIER (volatility adjustment, approx sqrt of ratio):
+          5min  → 1.00x  (baseline)
+          15min → 1.60x  (sqrt(3) ≈ 1.73, trimmed for safety)
+          30min → 2.25x  (sqrt(6) ≈ 2.45, trimmed for safety)
+
+        score >= 5 → hold to resolution (let market close naturally)
+
+        Examples (5min baseline):
+          score=1 → TP=30%, SL=16%
+          score=2 → TP=45%, SL=21%
+          score=3 → TP=60%, SL=26%
+          score=4 → TP=75%, SL=31%
+          score=5+ → hold to resolution
+
+        Examples (15min, 1.6x mult):
+          score=1 → TP=48%, SL=26%
+          score=3 → TP=96%, SL=42%
+
+        Examples (30min, 2.25x mult):
+          score=1 → TP=68%, SL=36%
+          score=3 → TP=135%, SL=59%
+        """
         score = max(1, int(score))
+        tf = int(timeframe) if timeframe else 5
+        if tf <= 5:
+            mult = 1.0
+        elif tf <= 15:
+            mult = 1.6
+        elif tf <= 30:
+            mult = 2.25
+        else:
+            # Very long tf — cap multiplier so SL stays sane
+            mult = min(3.0, (tf / 5.0) ** 0.5)
+
         if score >= 5:
-            return {'tp_pct': 200.0, 'sl_pct': 50.0, 'hold_to_resolution': True}
-        tp_pct = 30.0 + (score - 1) * 15.0  # 30, 45, 60, 75
-        sl_pct = 16.0 + (score - 1) * 5.0   # 16, 21, 26, 31
-        return {'tp_pct': tp_pct, 'sl_pct': sl_pct, 'hold_to_resolution': False}
+            # Hold to resolution: wide SL, but still scale so 30m doesn't
+            # get nuked on a quick -50% dip.
+            return {
+                'tp_pct': 200.0,
+                'sl_pct': min(75.0, 50.0 * mult),
+                'hold_to_resolution': True,
+            }
+        base_tp = 30.0 + (score - 1) * 15.0   # 30, 45, 60, 75
+        base_sl = 16.0 + (score - 1) * 5.0    # 16, 21, 26, 31
+        return {
+            'tp_pct': round(base_tp * mult, 1),
+            'sl_pct': round(base_sl * mult, 1),
+            'hold_to_resolution': False,
+        }
 
     def __init__(self, signal: TradeSignal, size_pusd: float, entry_price: float,
                  order_id: str = None, shares_filled: float = None):
@@ -97,7 +149,7 @@ class Position:
 
         conviction_tier = signal.metadata.get('conviction_tier', 'SINGLE')
         agreement_count = signal.metadata.get('agreement_count', 1)
-        exits = self.compute_exits_from_score(agreement_count)
+        exits = self.compute_exits_from_score(agreement_count, self.timeframe)
 
         self.take_profit_pct = exits['tp_pct']
         self.stop_loss_pct = exits['sl_pct']
@@ -303,7 +355,10 @@ class AutonomousExecutor:
             self.log('WARN', f"⚠️ Size {size_pusd:.2f} < min {Config.POLYMARKET_MIN_ORDER_SIZE} — skip")
             return None
 
-        # Liquidity depth check
+        # Liquidity depth check — need enough to BOTH enter and exit
+        # without excessive slippage. Required = 3x entry size on the buy
+        # side, 2x on the sell side (we'll exit smaller amounts as price
+        # moves). Skip the trade if either side is too thin.
         if signal.token_id and hasattr(self.clob, 'get_orderbook'):
             try:
                 book = self.clob.get_orderbook(signal.token_id)
@@ -311,12 +366,26 @@ class AutonomousExecutor:
                     side = 'BUY'
                     if signal.direction in ('SELL_UP', 'SHORT'):
                         side = 'SELL'
-                    depth = book.get('ask_depth', 0) if side == 'BUY' else book.get('bid_depth', 0)
-                    required = size_pusd * 5
-                    if depth < required:
+                    ask_depth = float(book.get('ask_depth', 0) or 0)
+                    bid_depth = float(book.get('bid_depth', 0) or 0)
+                    # Buy side (entry)
+                    entry_depth = ask_depth if side == 'BUY' else bid_depth
+                    # Exit side (opposite of entry)
+                    exit_depth = bid_depth if side == 'BUY' else ask_depth
+
+                    required_entry = size_pusd * 3
+                    required_exit = size_pusd * 2
+
+                    if entry_depth < required_entry:
                         self.log('LIQUIDITY',
-                                 f"⚠️ Thin book: {signal.coin} {signal.direction} "
-                                 f"depth=${depth:.2f} < 5x size=${required:.2f} — skip")
+                                 f"⚠️ Thin entry book: {signal.coin} {signal.direction} "
+                                 f"depth=${entry_depth:.2f} < 3x size=${required_entry:.2f} — skip")
+                        return None
+                    if exit_depth < required_exit:
+                        self.log('LIQUIDITY',
+                                 f"⚠️ Thin EXIT book: {signal.coin} {signal.direction} "
+                                 f"exit depth=${exit_depth:.2f} < 2x size=${required_exit:.2f} — skip "
+                                 f"(can't exit cleanly)")
                         return None
             except Exception as e:
                 self.log('DEBUG', f"Liquidity check skipped: {e}")
@@ -541,36 +610,123 @@ class AutonomousExecutor:
 
     async def _place_exit_order(self, pos: Position) -> Optional[Dict]:
         """
-        Place an actual opposite-side order on the CLOB to close the position.
-        Uses FOK at 1 tick past the current mid to guarantee execution at the
-        current price (or cancel if liquidity moved away).
-        Returns the raw CLOB result dict, or None on failure.
+        Place an actual SELL order on the CLOB to close the position.
+
+        Uses a MULTI-TIER FALLBACK CASCADE:
+          1. FOK at best bid (aggressive, likely to fill immediately)
+          2. FOK at best bid - 1 tick (price dropped, cross further)
+          3. FAK (fill-any-kill) at best bid - 2 ticks (accept partial)
+          4. GTC at best bid - 3 ticks (sit on book, best we can do)
+
+        Each attempt uses the exact share count we own (NEVER size_pusd,
+        which rounds UP and triggers "not enough balance" errors when the
+        computed size exceeds the position's actual share count).
+
+        We also re-read the orderbook before each tier so exits adapt to
+        price movement during cascade.
         """
         if not self.clob.is_initialized():
             return None
-        try:
-            # We bought the YES/NO token on entry. To exit, we SELL the same
-            # token (regardless of direction on the underlying market).
-            exit_side = 'SELL'
-            # Use the current cached price (what the monitor loop just set).
-            # Cross the spread by 1 tick to maximize fill probability.
-            price = max(0.01, min(0.99, round(pos.current_price - 0.01, 2)))
-            # Size back in pUSD for the helper's min-size math.
-            size_pusd = max(
-                Config.POLYMARKET_MIN_ORDER_SIZE,
-                pos.shares * pos.current_price,
-            )
-            self.log('TRADE',
-                     f"   📤 EXIT FOK {exit_side} {pos.shares:.2f}sh @ {price:.3f} "
-                     f"(token={pos.token_id[:10]}...)")
-            result = self.clob.place_fok_order(
-                token_id=pos.token_id, side=exit_side,
-                price=price, size_pusd=size_pusd,
-            )
-            return result
-        except Exception as e:
-            self.log('ERROR', f"   ❌ Exit order placement error: {e}")
+        if pos.shares <= 0:
+            self.log('ERROR', f"   ❌ Position has zero shares, nothing to sell")
             return None
+
+        # Truncate to 2 decimals — CLOB uses cent-shares. Never round up
+        # on exit or we'll request more shares than we own.
+        owned_shares = (int(pos.shares * 100)) / 100.0
+        if owned_shares <= 0:
+            self.log('ERROR', f"   ❌ Owned shares rounds to 0 ({pos.shares})")
+            return None
+
+        # Pull fresh orderbook for best bid
+        try:
+            book = self.clob.get_orderbook(pos.token_id)
+        except Exception:
+            book = None
+
+        best_bid = (book or {}).get('best_bid') or max(0.01, pos.current_price - 0.02)
+
+        # Cascade of (order_type, price_offset_ticks, label) tuples.
+        # Each successive tier crosses deeper into the book.
+        cascade = [
+            ('FOK', 0,  'tier1_fok_best_bid'),
+            ('FOK', -1, 'tier2_fok_1tick_below'),
+            ('FAK', -2, 'tier3_fak_2tick_below'),
+            ('GTC', -3, 'tier4_gtc_3tick_below'),
+        ]
+
+        last_error = None
+        for order_type, offset, label in cascade:
+            # Refresh book each retry (price can move during cascade)
+            if offset != 0:
+                try:
+                    book = self.clob.get_orderbook(pos.token_id)
+                    best_bid = (book or {}).get('best_bid') or best_bid
+                except Exception:
+                    pass
+
+            price = round(max(0.01, min(0.99, best_bid + offset * 0.01)), 2)
+
+            # Liquidity sanity: if there's literally no bid depth at this
+            # price, skip this tier. (Dashboard logs the issue.)
+            if book:
+                try:
+                    bid_depth = float(book.get('bid_depth') or 0)
+                    if bid_depth < 1.0 and order_type == 'FOK':
+                        self.log('LIQUIDITY',
+                                 f"   ⚠️ {label}: bid depth ${bid_depth:.2f} too thin for FOK")
+                        continue
+                except Exception:
+                    pass
+
+            self.log('TRADE',
+                     f"   📤 EXIT [{label}] {order_type} SELL {owned_shares:.2f}sh "
+                     f"@ {price:.3f} (best_bid={best_bid:.3f})")
+            try:
+                result = self.clob.place_sell_shares(
+                    token_id=pos.token_id,
+                    shares=owned_shares,
+                    price=price,
+                    order_type=order_type,
+                )
+            except Exception as e:
+                last_error = str(e)
+                self.log('WARN', f"   ⚠️ {label} exception: {e}")
+                continue
+
+            if not result:
+                self.log('WARN', f"   ⚠️ {label} returned no result, trying next tier")
+                continue
+
+            status = (result.get('status') or 'UNKNOWN').upper()
+            if status == 'MATCHED':
+                self.log('TRADE', f"   ✅ Exit filled via {label}")
+                result['_cascade_label'] = label
+                return result
+
+            # FAK may partial-fill. Check via trades.
+            if order_type == 'FAK' or status in ('DELAYED', 'LIVE'):
+                await asyncio.sleep(0.3)
+                trades = self.clob.get_trades_for_order(result.get('order_id', ''))
+                if trades:
+                    self.log('TRADE',
+                             f"   ✅ Exit partial-filled via {label} (trades={len(trades)})")
+                    result['_cascade_label'] = label
+                    return result
+                # GTC that's still LIVE — position is on the book; accept
+                # this result even though unfilled. It will resolve later.
+                if order_type == 'GTC' and status == 'LIVE':
+                    self.log('WARN',
+                             f"   ⚠️ {label} sitting unfilled — will resolve via market settlement")
+                    result['_cascade_label'] = label
+                    return result
+
+            self.log('WARN', f"   ⚠️ {label} status={status}, trying next tier")
+
+        self.log('ERROR',
+                 f"   ❌ All exit tiers failed. Position will rely on market resolution. "
+                 f"last_error={last_error}")
+        return None
 
     async def _close_position(self, pid: str, reason: str):
         pos = self.open_positions.pop(pid, None)
@@ -578,9 +734,10 @@ class AutonomousExecutor:
             return
 
         # In LIVE mode, actually place a SELL order before booking PnL.
-        # If the exit fails, we keep paper-PnL accounting so the dashboard
-        # still reflects what happened, but we loudly log the failure.
+        # If the exit fails, re-insert the position so monitor_positions()
+        # can retry on the next scan (instead of silently losing it).
         exit_fill_price = pos.current_price
+        exit_filled = False
         if not Config.is_paper():
             self.log('TRADE',
                      f"🔚 Closing LIVE {pos.coin} {pos.direction} — reason={reason}")
@@ -588,35 +745,45 @@ class AutonomousExecutor:
             if exit_result:
                 pos.exit_order_id = exit_result.get('order_id')
                 status = (exit_result.get('status') or 'UNKNOWN').upper()
+                label = exit_result.get('_cascade_label', 'cascade')
                 if status == 'MATCHED':
-                    # Fully closed. Use actual fill price for PnL accuracy.
                     actual = self.clob.get_fill_price(
                         pos.exit_order_id, fallback=pos.current_price
                     )
                     exit_fill_price = actual
+                    exit_filled = True
                     self.log('TRADE',
-                             f"   ✅ Exit FILLED @ {actual:.3f} (id={pos.exit_order_id})")
+                             f"   ✅ Exit FILLED @ {actual:.3f} via {label} "
+                             f"(id={pos.exit_order_id})")
                 else:
-                    # FOK that didn't instantly match: wait briefly and recheck
-                    # via get_trades (the exit may still land async).
-                    self.log('WARN',
-                             f"   ⚠️ Exit order status={status} — polling trades")
+                    # LIVE / DELAYED / partial — poll trades
                     await asyncio.sleep(0.5)
                     trades = self.clob.get_trades_for_order(pos.exit_order_id)
                     if trades:
                         exit_fill_price = self.clob.get_fill_price(
                             pos.exit_order_id, fallback=pos.current_price
                         )
+                        exit_filled = True
                         self.log('TRADE',
-                                 f"   ✅ Exit filled (from trades) @ {exit_fill_price:.3f}")
+                                 f"   ✅ Exit filled (from trades) @ {exit_fill_price:.3f} "
+                                 f"via {label}")
                     else:
-                        self.log('ERROR',
-                                 f"   ❌ Exit FOK did NOT fill — position may still be "
-                                 f"on-chain. Will rely on market resolution.")
+                        # Unfilled but sitting on book (GTC fallback). Keep
+                        # the position open-ish — let next scan re-evaluate.
+                        self.log('WARN',
+                                 f"   ⚠️ Exit {label} still unfilled — re-queuing position")
+                        pos.status = 'closing'
+                        self.open_positions[pid] = pos
+                        return
             else:
+                # All cascade tiers failed. Re-queue the position so next
+                # scan will retry. We keep it in open_positions so TP/SL
+                # logic continues to monitor it.
                 self.log('ERROR',
-                         f"   ❌ Could not place exit order. Position may still be "
-                         f"on-chain — will rely on market resolution.")
+                         f"   ❌ All exit tiers failed — re-queuing position for retry next scan")
+                pos.status = 'exit_failed'
+                self.open_positions[pid] = pos
+                return
 
         # Recompute PnL at the actual exit price
         pos.update_price(exit_fill_price)

@@ -745,11 +745,10 @@ async def bot_loop():
             STATE['total_pnl'] = risk_mgr.total_pnl
             STATE['daily_pnl'] = risk_mgr.daily_pnl
 
-            if not can_trade:
-                add_log("RISK", f"Trading blocked: {reason}")
-                await asyncio.sleep(30)
-                continue
-
+            # ─── IMPORTANT: position monitoring runs regardless of can_trade ───
+            # can_trade only blocks NEW ENTRIES. Open positions MUST keep being
+            # monitored or they'll miss TP/SL + stay stuck on-chain during
+            # drawdowns or consecutive-loss halts.
             try:
                 markets = gamma.discover_markets()
             except Exception as e:
@@ -762,18 +761,12 @@ async def bot_loop():
                  'q': m['question'][:60]} for m in (markets or [])[:12]
             ]
 
-            if not markets:
-                add_log("SCAN", "No active markets. Waiting 10s...")
-                await asyncio.sleep(10)
-                continue
+            if markets:
+                coins_count = len(set(m['coin'] for m in markets))
+                tf_count = len(set(m['timeframe'] for m in markets))
+                add_log("SCAN", f"Found {len(markets)} markets ({coins_count} coins x {tf_count} TFs)")
 
-            coins_count = len(set(m['coin'] for m in markets))
-            tf_count = len(set(m['timeframe'] for m in markets))
-            add_log("SCAN", f"Found {len(markets)} markets ({coins_count} coins x {tf_count} TFs)")
-
-            # ── Pending-order polling: check if GTC limits have filled ──
-            # This MUST run before monitor_positions so newly-filled orders
-            # become positions visible to TP/SL logic on the same scan.
+            # ── Pending-order polling (ALWAYS) ──
             if executor.pending_orders:
                 try:
                     resolved = await executor.monitor_pending_orders()
@@ -783,18 +776,33 @@ async def bot_loop():
                 except Exception as e:
                     add_error(f"Pending-order monitor: {e}", e)
 
+            # ── Position TP/SL monitoring (ALWAYS — even during halt) ──
             if executor.open_positions:
                 pos_tokens = [p.token_id for p in executor.open_positions.values()]
-                current_prices = await market_cache.get_mid_prices(pos_tokens)
-                closed_this_scan = await executor.monitor_positions(
-                    {k: v for k, v in current_prices.items() if v is not None}
-                )
-                if closed_this_scan:
-                    add_log("INFO", f"Closed {len(closed_this_scan)} positions this scan")
+                try:
+                    current_prices = await market_cache.get_mid_prices(pos_tokens)
+                    closed_this_scan = await executor.monitor_positions(
+                        {k: v for k, v in current_prices.items() if v is not None}
+                    )
+                    if closed_this_scan:
+                        add_log("INFO", f"Closed {len(closed_this_scan)} positions this scan")
+                except Exception as e:
+                    add_error(f"Position monitor: {e}", e)
 
             STATE['open_positions'] = executor.get_positions_snapshot()
             STATE['closed_trades'] = executor.get_closed_snapshot(15)
             STATE['pending_orders'] = executor.get_pending_snapshot()
+
+            # ── New-entry gate: if risk blocks or no markets, skip signals ──
+            if not can_trade:
+                add_log("RISK", f"No new entries: {reason} (but still monitoring positions)")
+                await asyncio.sleep(5)
+                continue
+
+            if not markets:
+                add_log("SCAN", "No active markets. Waiting 10s...")
+                await asyncio.sleep(10)
+                continue
 
             context = {
                 'clob': clob,
