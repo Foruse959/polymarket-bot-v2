@@ -205,7 +205,14 @@ class V2RiskManager:
         return self.current_tier
 
     def can_trade(self) -> Tuple[bool, str]:
-        """Check if trading is currently allowed."""
+        """
+        Check if NEW ENTRIES are allowed.
+
+        NOTE: this only controls NEW ENTRIES. Position monitoring, TP/SL,
+        auto-exits, and auto-redeem ALWAYS run regardless — see the scan
+        loop in dashboard.py. A halt that prevented monitoring would leave
+        positions stuck unable to sell even when they hit stop-loss.
+        """
         self._check_tier_change()
 
         if self._halted:
@@ -217,10 +224,21 @@ class V2RiskManager:
         if self.balance < Config.POLYMARKET_MIN_ORDER_SIZE:
             return False, f"💀 Balance too low ({self.balance:.2f} < {Config.POLYMARKET_MIN_ORDER_SIZE} pUSD)"
 
+        # Drawdown is now a NOTIFICATION, not a halt. Rationale: halting
+        # would stop new entries AND the scan loop would skip monitoring
+        # (old behavior), causing open positions to go unattended and
+        # unsellable. Positions need to be monitored continuously —
+        # especially during a drawdown when they might be about to hit SL.
         dd = self._drawdown_pct()
         if dd >= Config.DRAWDOWN_HALT_PCT:
-            self._halt(f"Drawdown {dd:.1f}%", 300)
-            return False, f"📉 Drawdown halt: {dd:.1f}%"
+            # Fire alert once per 5min so we don't spam logs
+            now = time.time()
+            if now - getattr(self, '_last_dd_alert', 0) > 300:
+                self._last_dd_alert = now
+                self.log('WARN',
+                         f"📉 DRAWDOWN ALERT: {dd:.1f}% (threshold {Config.DRAWDOWN_HALT_PCT:.0f}%) "
+                         f"— new entries suppressed, but positions continue to be monitored")
+            return False, f"📉 Drawdown alert: {dd:.1f}% (monitoring only)"
 
         if self.consecutive_losses >= Config.CONSECUTIVE_LOSS_HALT:
             self._halt(f"{self.consecutive_losses} consecutive losses", 180)

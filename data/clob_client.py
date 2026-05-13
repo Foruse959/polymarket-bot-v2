@@ -536,7 +536,14 @@ class ClobClient:
         if not self._py_clob_client:
             return False
         try:
-            self._py_clob_client.cancel(order_id)
+            # V2 SDK uses cancel_order(id); fall back to cancel() for V1.
+            if hasattr(self._py_clob_client, 'cancel_order'):
+                self._py_clob_client.cancel_order(order_id)
+            elif hasattr(self._py_clob_client, 'cancel'):
+                self._py_clob_client.cancel(order_id)
+            else:
+                print(f"[CLOB] ❌ No cancel method available on SDK", flush=True)
+                return False
             return True
         except Exception as e:
             print(f"[CLOB] ❌ Cancel failed: {e}", flush=True)
@@ -683,6 +690,107 @@ class ClobClient:
                 return self._place_order_v1(token_id, side, size_pusd, price, 'FOK')
         except Exception as e:
             print(f"[CLOB] ❌ FOK order failed: {e}", flush=True)
+            return None
+
+    # ───────────────────────────────────────────────────────────────
+    # EXIT ORDER PLACEMENT — uses exact share count, not pUSD math
+    # ───────────────────────────────────────────────────────────────
+    # When selling a position we MUST use the exact shares we own.
+    # Computing shares from pUSD + price rounds UP and can ask the CLOB
+    # to sell more than we hold, causing "not enough balance" errors.
+    # These helpers bypass _calculate_shares and pass the share count
+    # directly to the SDK.
+
+    def _place_sell_exact_shares_v2(self, token_id: str, shares: float,
+                                    price: float, order_type: str,
+                                    neg_risk: bool = False) -> Optional[Dict]:
+        """Sell exactly `shares` tokens via V2 SDK. No rounding-up."""
+        from py_clob_client_v2.clob_types import (
+            OrderArgs as OrderArgsV2, OrderType as V2OrderType, PartialCreateOrderOptions,
+        )
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        if price is None or price <= 0:
+            price = 0.50
+        price = max(0.01, min(0.99, round(price, 2)))
+        # Polymarket tick size is 0.01 for sizes. Round DOWN to not exceed
+        # owned shares. If the price-size gcd requires a larger step, round
+        # further down — better to leave dust than to reject.
+        P = int(round(price * 100))
+        S = int(shares * 100)  # truncate to cent-shares
+        if P > 0 and S > 0:
+            # Orders must satisfy P*S % 100 == 0 (same tick rule as buy).
+            import math
+            step = 100 // math.gcd(P, 100)
+            S = (S // step) * step
+            if S <= 0:
+                print(f"[CLOB] ❌ Share count too small after tick rounding: {shares}", flush=True)
+                return None
+        adjusted_shares = S / 100.0
+        order_amount = round(price * adjusted_shares, 2)
+
+        if order_amount < Config.POLYMARKET_MIN_ORDER_SIZE:
+            print(f"[CLOB] ⚠️ Sell order below min: {order_amount:.2f} < "
+                  f"{Config.POLYMARKET_MIN_ORDER_SIZE}. shares={adjusted_shares:.2f} @ {price:.2f}", flush=True)
+            # Try bumping to MIN — but ONLY if we own enough
+            needed_shares = Config.POLYMARKET_MIN_ORDER_SIZE / price
+            if needed_shares > shares:
+                print(f"[CLOB] ❌ Can't reach min (need {needed_shares:.2f}sh, own {shares:.2f}sh)",
+                      flush=True)
+                return None
+            # Bump to MIN-satisfying shares, still capped at owned
+            S = int(math.ceil(needed_shares * 100))
+            if P > 0 and S > 0:
+                step = 100 // math.gcd(P, 100)
+                S = ((S + step - 1) // step) * step
+            adjusted_shares = min(S / 100.0, shares)
+            order_amount = round(price * adjusted_shares, 2)
+
+        print(f"[CLOB] 📤 V2 {order_type} SELL {adjusted_shares:.2f}sh "
+              f"(own {shares:.2f}) @ ${price:.2f} = ${order_amount:.2f}", flush=True)
+
+        order_args = OrderArgsV2(
+            token_id=token_id, side=SELL, price=price, size=adjusted_shares,
+            builder_code=self._builder_code,
+        )
+        options = PartialCreateOrderOptions(tick_size="0.01", neg_risk=neg_risk)
+        signed_order = self._py_clob_client.create_order(order_args, options)
+        type_map = {'GTC': V2OrderType.GTC, 'FOK': V2OrderType.FOK, 'FAK': V2OrderType.FAK}
+        v2_type = type_map.get(order_type, V2OrderType.FOK)
+        resp = self._py_clob_client.post_order(signed_order, v2_type)
+        order_id = resp.get('orderID') or resp.get('order_id') or resp.get('id', 'unknown')
+        status = resp.get('status', 'UNKNOWN')
+        print(f"[CLOB] ✅ SELL placed: id={order_id} status={status}", flush=True)
+        return {
+            'order_id': order_id, 'status': status,
+            'price': price, 'size': adjusted_shares, 'size_pusd': order_amount,
+            'side': 'SELL', 'type': order_type,
+        }
+
+    def place_sell_shares(self, token_id: str, shares: float, price: float,
+                          order_type: str = 'FOK',
+                          neg_risk: bool = False) -> Optional[Dict]:
+        """
+        Sell exactly `shares` of a position token. This is what EXIT flows
+        must call — never pass size_pusd here, or rounding up will ask the
+        CLOB to sell more than you own.
+
+        `order_type` is one of FOK / FAK / GTC.
+        """
+        if not self._py_clob_client:
+            print("[CLOB] ❌ Client not initialized — cannot place SELL order", flush=True)
+            return None
+        if shares <= 0:
+            return None
+        try:
+            if self._is_v2:
+                return self._place_sell_exact_shares_v2(
+                    token_id, shares, price, order_type, neg_risk
+                )
+            # V1 path (rare — V2 is the default since April 2026)
+            return self._place_order_v1(token_id, 'SELL', shares * price, price, order_type)
+        except Exception as e:
+            print(f"[CLOB] ❌ SELL order failed: {e}", flush=True)
             return None
 
     def is_initialized(self) -> bool:

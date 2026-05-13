@@ -324,6 +324,62 @@ class Config:
         cls._coin_settings = _load_coin_settings()
         cls.ENABLED_COINS = cls._get_enabled_coins()
 
+    # ─── TIMEFRAME PREFERENCE MANAGEMENT ──────────────────────────
+    ALL_SUPPORTED_TIMEFRAMES = [5, 15, 30]
+
+    @classmethod
+    def update_enabled_timeframes(cls, timeframes: list) -> bool:
+        """
+        Toggle enabled timeframes at runtime (called by Telegram /timeframe
+        command). Persists to coin_settings.json.
+        """
+        valid = []
+        for t in timeframes:
+            try:
+                tf = int(t)
+                if tf in cls.ALL_SUPPORTED_TIMEFRAMES:
+                    valid.append(tf)
+            except (ValueError, TypeError):
+                continue
+        if not valid:
+            return False
+        # De-dup + sort for stable ordering
+        valid = sorted(set(valid))
+        cls.ENABLED_TIMEFRAMES = valid
+        cls._coin_settings['enabled_timeframes'] = valid
+        return _save_coin_settings(cls._coin_settings)
+
+    @classmethod
+    def toggle_timeframe(cls, tf: int) -> bool:
+        """Toggle a single timeframe on/off. Returns True if now enabled."""
+        try:
+            tf = int(tf)
+        except (ValueError, TypeError):
+            return False
+        if tf not in cls.ALL_SUPPORTED_TIMEFRAMES:
+            return False
+        current = list(cls.ENABLED_TIMEFRAMES)
+        if tf in current:
+            current.remove(tf)
+            if not current:
+                # Don't allow empty — keep the toggled one
+                current = [tf]
+                cls.update_enabled_timeframes(current)
+                return True
+        else:
+            current.append(tf)
+        cls.update_enabled_timeframes(current)
+        return tf in cls.ENABLED_TIMEFRAMES
+
+    @classmethod
+    def _load_saved_timeframes(cls):
+        """Restore saved timeframes from settings on startup (if any)."""
+        saved = cls._coin_settings.get('enabled_timeframes')
+        if saved and isinstance(saved, list):
+            valid = [int(t) for t in saved if int(t) in cls.ALL_SUPPORTED_TIMEFRAMES]
+            if valid:
+                cls.ENABLED_TIMEFRAMES = sorted(set(valid))
+
     @classmethod
     def print_status(cls):
         mode = '📋 PAPER' if cls.is_paper() else '🔴 LIVE'
@@ -344,3 +400,4 @@ class Config:
 
 # Initialize enabled coins AFTER class definition
 Config.ENABLED_COINS = Config._get_enabled_coins()
+Config._load_saved_timeframes()

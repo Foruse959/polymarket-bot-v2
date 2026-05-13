@@ -64,6 +64,7 @@ class TelegramUI:
             "Commands:\n"
             "  /status — balance &amp; PnL\n"
             "  /coins — select BTC/ETH/SOL/XRP\n"
+            "  /timeframe — select 5/15/30 min markets\n"
             "  /tier — change trading tier (SURVIVAL/SEED/etc)\n"
             "  /positions — open trades\n"
             "  /recent — last 10 trades\n"
@@ -164,6 +165,57 @@ class TelegramUI:
 
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await self.cmd_start(update, ctx)
+
+    async def cmd_timeframe(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Show timeframe toggle buttons. Changes apply to the NEXT scan."""
+        buttons = self._build_timeframe_buttons()
+        await update.message.reply_html(
+            "<b>⏱️ Select timeframes to trade:</b>\n"
+            "Tap a timeframe to toggle ON/OFF\n"
+            f"<i>Currently enabled: {Config.ENABLED_TIMEFRAMES} min</i>\n\n"
+            "<i>Note: 5min markets are fastest. 15/30min give more time for signals to play out "
+            "but have wider SL/TP (volatility-adjusted).</i>",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    async def timeframe_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle timeframe toggle button press."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        if not data.startswith('tf:'):
+            return
+        try:
+            tf = int(data.split(':', 1)[1])
+        except ValueError:
+            return
+        Config.toggle_timeframe(tf)
+        buttons = self._build_timeframe_buttons()
+        try:
+            await query.edit_message_text(
+                text=(
+                    "<b>⏱️ Select timeframes to trade:</b>\n"
+                    "Tap a timeframe to toggle ON/OFF\n"
+                    f"<i>Currently enabled: {Config.ENABLED_TIMEFRAMES} min</i>"
+                ),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception:
+            pass
+
+    def _build_timeframe_buttons(self):
+        rows = []
+        row = []
+        for tf in Config.ALL_SUPPORTED_TIMEFRAMES:
+            enabled = tf in Config.ENABLED_TIMEFRAMES
+            mark = '✅' if enabled else '❌'
+            row.append(InlineKeyboardButton(
+                f"{mark} {tf}min",
+                callback_data=f"tf:{tf}",
+            ))
+        rows.append(row)
+        return rows
 
     async def cmd_tier(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Show tier picker. Lets user override balance-based tier selection."""
@@ -326,6 +378,7 @@ class TelegramUI:
         self.app.add_handler(CommandHandler("help", self.cmd_help))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("coins", self.cmd_coins))
+        self.app.add_handler(CommandHandler("timeframe", self.cmd_timeframe))
         self.app.add_handler(CommandHandler("tier", self.cmd_tier))
         self.app.add_handler(CommandHandler("positions", self.cmd_positions))
         self.app.add_handler(CommandHandler("recent", self.cmd_recent))
@@ -333,6 +386,7 @@ class TelegramUI:
         self.app.add_handler(CommandHandler("resume", self.cmd_resume))
         self.app.add_handler(CallbackQueryHandler(self.coin_callback, pattern=r'^coin:'))
         self.app.add_handler(CallbackQueryHandler(self.tier_callback, pattern=r'^tier:'))
+        self.app.add_handler(CallbackQueryHandler(self.timeframe_callback, pattern=r'^tf:'))
 
         try:
             loop.run_until_complete(self.app.run_polling(close_loop=False, stop_signals=None))
