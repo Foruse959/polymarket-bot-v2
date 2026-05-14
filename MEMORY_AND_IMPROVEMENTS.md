@@ -174,23 +174,55 @@ These are proven correct. Changing them will break things:
 
 #### 1. MARKET RESOLUTION TIMING (HIGHEST PRIORITY)
 
-**The bug:** Bot doesn't track market end time. On a 15min market, user was +90% profit with 1 minute left. Bot triggered TP/SL at the last second, couldn't sell (no liquidity), market resolved in opposite direction, user lost.
+**The bug:** Bot has NO awareness of market closing time. It doesn't track `seconds_remaining` for open positions. It doesn't know when a market has already resolved.
 
-**Real-world example from logs:**
+**Real-world incident (May 14, 2026):**
 ```
-Position was UP +90% on 15min market
-Last 60 seconds: liquidity dried up (no bids on book)
-Bot tried to SELL at last second → FOK failed (no liquidity)
-Market resolved → position lost (oracle flipped in final seconds)
-Even AFTER resolution, bot still tried to sell (doesn't know market ended)
+15min market, position was UP +90% profit
+Bot did NOT sell during the market (no TP trigger or it missed the window)
+In the LAST MINUTE: market reversed (volatile final seconds, oracle update flipped direction)
+Bot THEN tried to sell — but too late, book was empty (no liquidity at market close)
+SELL FOK failed — "not enough balance" / no bids
+Market resolved in the OPPOSITE direction → position went from +90% to LOSS
+Even AFTER market closed/resolved, bot STILL attempted to sell (doesn't know market ended)
 ```
 
-**The correct behavior (hybrid approach):**
-- **If WINNING and < 60s remaining:** DO NOT SELL. Let market auto-resolve. Winning shares → $1.00 with ZERO fees. AutoRedeemer picks them up. This saves 10-15% per winning trade (no taker fee, no spread).
-- **If LOSING and < 60s remaining:** Try to sell at 60s mark (while liquidity still exists). If can't sell by 30s, accept the loss — don't sell at the last second into an empty book.
-- **After market resolves:** Stop trying to sell. Mark position as "awaiting_resolution". AutoRedeemer handles it.
+**What went wrong (3 separate failures):**
+1. Bot didn't sell when it was +90% profit before the volatile last minute
+2. Bot tried to sell in the last seconds when liquidity was gone
+3. Bot didn't know market had already resolved and kept trying to sell a dead position
 
-**Why this is the #1 priority:** The user was +90% profit and LOST because the bot tried to be clever at the wrong time. Holding to resolution would have been a clean $1.00 win.
+**The correct behavior (smart resolution-aware exit):**
+
+The bot must track `seconds_remaining` per position and make a decision:
+
+**CASE A — Position is IN PROFIT and market is about to close (< 60s):**
+- **If you EXPECT it will resolve in your favor** (i.e., price hasn't reversed, trend is stable): **DO NOT SELL. Wait for resolution.** Winning shares auto-resolve to $1.00 with ZERO fees (no taker fee, no spread crossing). This is ALWAYS better than selling at 0.85-0.90 and paying 3% fees. AutoRedeemer picks up the resolved tokens.
+- **If you SENSE reversal risk** (price is moving against you, or the last few seconds show momentum change): **Sell at 60-30 seconds remaining**, while liquidity still exists and you can still cross the spread. Don't wait until < 10s when the book is empty.
+
+**CASE B — Position is in LOSS and market is about to close (< 60s):**
+- Try to sell at 60s mark while there's still some bid liquidity
+- If can't sell by 30s remaining, STOP trying — accept the loss, let market resolve
+- Don't sell into an empty book at the last second (you'll get worst price or fail entirely)
+
+**CASE C — Market has already resolved:**
+- STOP trying to sell immediately. Mark position as `awaiting_redemption`
+- AutoRedeemer will handle it on next 2-min check cycle
+- Never place a SELL order on a resolved/closed market
+
+**Implementation approach:**
+- `gamma.discover_markets()` already returns `seconds_remaining` per market
+- Pass this to executor's `monitor_positions()` so each position knows how close market end is
+- Add a `should_hold_to_resolution()` check that overrides TP/SL in the final 60s
+- Track market close timestamp per position (from gamma market data at entry time)
+- After close time passes: mark position as `resolved`, stop all sell attempts
+
+**Why this is the #1 priority:** User had a +90% winning trade that turned into a loss because:
+- The bot didn't book profits when it should have (before the volatile last minute)
+- Then tried to sell when it was too late (empty book)
+- Then kept trying after market was already dead
+
+This single fix would have saved that entire trade AND future trades. The resolution-hold approach (Case A) also saves 10-15% in fees on every winning trade that resolves naturally.
 
 #### 2. No Reconciliation on Restart
 Bot forgets positions after crash. Fix: persist executor state to JSON, or rebuild from CLOB trades on startup.
